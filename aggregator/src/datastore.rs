@@ -3711,11 +3711,12 @@ pub mod test_util {
     use rand::{distributions::Standard, thread_rng, Rng};
     use ring::aead::{LessSafeKey, UnboundKey, AES_128_GCM};
     use std::{
+        collections::HashMap,
         env::{self, VarError},
         process::Command,
         str::FromStr,
     };
-    use testcontainers::{images::postgres::Postgres, Container, RunnableImage};
+    use testcontainers::{core::WaitFor, Container, Image, ImageArgs, RunnableImage};
     use tokio_postgres::{Config, NoTls};
     use tracing::trace;
 
@@ -3725,6 +3726,45 @@ pub mod test_util {
     lazy_static! {
         static ref CONTAINER_CLIENT: testcontainers::clients::Cli =
             testcontainers::clients::Cli::default();
+        static ref POSTGRES_ENV_VARS: HashMap<String, String> = HashMap::from([
+            ("POSTGRES_DB".to_string(), "postgres".to_string()),
+            ("POSTGRES_HOST_AUTH_METHOD".to_string(), "trust".to_string()),
+            ("PGDATA".to_string(), "/pgtmpfs".to_string()),
+        ]);
+    }
+
+    #[derive(Default)]
+    struct Postgres;
+
+    impl Image for Postgres {
+        type Args = PostgresArgs;
+
+        fn name(&self) -> String {
+            "postgres".to_string()
+        }
+
+        fn tag(&self) -> String {
+            "14-alpine".to_string()
+        }
+
+        fn ready_conditions(&self) -> Vec<WaitFor> {
+            Vec::from([WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            )])
+        }
+
+        fn env_vars(&self) -> Box<dyn Iterator<Item = (&String, &String)> + '_> {
+            Box::new(POSTGRES_ENV_VARS.iter())
+        }
+    }
+
+    #[derive(Default, Debug, Clone)]
+    struct PostgresArgs;
+
+    impl ImageArgs for PostgresArgs {
+        fn into_iterator(self) -> Box<dyn Iterator<Item = String>> {
+            Box::new(Vec::from(["--mount=type=tmpfs,destination=/pgtmpfs".to_string()]).into_iter())
+        }
     }
 
     /// DbHandle represents a handle to a running (ephemeral) database. Dropping this value
@@ -3854,8 +3894,7 @@ pub mod test_util {
     /// schema and creates a datastore.
     pub fn ephemeral_db_handle() -> DbHandle {
         // Start an instance of Postgres running in a container.
-        let db_container =
-            CONTAINER_CLIENT.run(RunnableImage::from(Postgres::default()).with_tag("14-alpine"));
+        let db_container = CONTAINER_CLIENT.run(RunnableImage::from(Postgres::default()));
 
         // Compute the Postgres connection string.
         const POSTGRES_DEFAULT_PORT: u16 = 5432;
