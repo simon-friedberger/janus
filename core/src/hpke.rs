@@ -36,6 +36,7 @@ fn hpke_dispatch_config_from_hpke_config(
 
 /// Construct the HPKE associated data for sealing or opening data enciphered for a report or report
 /// share, per §4.3.2 and 4.4.1.3 of draft-ietf-ppm-dap-02
+// TODO(timg): this needs to take report_id: &ReportId and incorporate it into AAD
 pub fn associated_data_for_report_share<M: Encode>(
     task_id: &TaskId,
     report_metadata: &M,

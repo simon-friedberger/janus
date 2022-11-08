@@ -272,6 +272,20 @@ impl Decode for ReportId {
     }
 }
 
+impl FromStr for ReportId {
+    type Err = Box<dyn Debug>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes =
+            base64::decode_config(s, URL_SAFE_NO_PAD).map_err(|e| Box::new(e) as Box<dyn Debug>)?;
+        let bytes: [u8; Self::LEN] = bytes.try_into().map_err(|_| {
+            Box::new(format!("decoded base64 {s} has wrong length")) as Box<dyn Debug>
+        })?;
+
+        Ok(Self::from(bytes))
+    }
+}
+
 impl Distribution<ReportId> for Standard {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> ReportId {
         ReportId(rng.gen())
@@ -475,6 +489,20 @@ impl Decode for TaskId {
         let mut decoded = [0u8; Self::LEN];
         bytes.read_exact(&mut decoded)?;
         Ok(Self(decoded))
+    }
+}
+
+impl FromStr for TaskId {
+    type Err = Box<dyn Debug>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bytes =
+            base64::decode_config(s, URL_SAFE_NO_PAD).map_err(|e| Box::new(e) as Box<dyn Debug>)?;
+        let bytes: [u8; Self::LEN] = bytes.try_into().map_err(|_| {
+            Box::new(format!("decoded base64 {s} has wrong length")) as Box<dyn Debug>
+        })?;
+
+        Ok(Self::from(bytes))
     }
 }
 

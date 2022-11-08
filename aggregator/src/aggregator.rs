@@ -339,12 +339,17 @@ impl<C: Clock> Aggregator<C> {
         Ok(task_aggregator.handle_hpke_config().get_encoded())
     }
 
-    async fn handle_upload(&self, report_bytes: &[u8]) -> Result<(), Error> {
+    async fn handle_upload(
+        &self,
+        task_id: &TaskId,
+        report_id: &ReportId,
+        report_bytes: &[u8],
+    ) -> Result<(), Error> {
         let report = Report::get_decoded(report_bytes)?;
 
-        let task_aggregator = self.task_aggregator_for(report.task_id()).await?;
+        let task_aggregator = self.task_aggregator_for(task_id).await?;
         if task_aggregator.task.role() != &Role::Leader {
-            return Err(Error::UnrecognizedTask(*report.task_id()));
+            return Err(Error::UnrecognizedTask(*task_id));
         }
         task_aggregator
             .handle_upload(
@@ -352,6 +357,7 @@ impl<C: Clock> Aggregator<C> {
                 &self.clock,
                 &self.upload_decrypt_failure_counter,
                 &self.upload_decode_failure_counter,
+                report_id,
                 report,
             )
             .await
@@ -683,6 +689,7 @@ impl TaskAggregator {
         clock: &C,
         upload_decrypt_failure_counter: &Counter<u64>,
         upload_decode_failure_counter: &Counter<u64>,
+        report_id: &ReportId,
         report: Report,
     ) -> Result<(), Error> {
         self.vdaf_ops
@@ -692,6 +699,7 @@ impl TaskAggregator {
                 upload_decrypt_failure_counter,
                 upload_decode_failure_counter,
                 &self.task,
+                report_id,
                 report,
             )
             .await
@@ -821,6 +829,7 @@ impl VdafOps {
         upload_decrypt_failure_counter: &Counter<u64>,
         upload_decode_failure_counter: &Counter<u64>,
         task: &Task,
+        report_id: &ReportId,
         report: Report,
     ) -> Result<(), Error> {
         match self {
@@ -832,6 +841,7 @@ impl VdafOps {
                     upload_decrypt_failure_counter,
                     upload_decode_failure_counter,
                     task,
+                    report_id,
                     report,
                 )
                 .await
@@ -848,6 +858,7 @@ impl VdafOps {
                     upload_decrypt_failure_counter,
                     upload_decode_failure_counter,
                     task,
+                    report_id,
                     report,
                 )
                 .await
@@ -860,6 +871,7 @@ impl VdafOps {
                     upload_decrypt_failure_counter,
                     upload_decode_failure_counter,
                     task,
+                    report_id,
                     report,
                 )
                 .await
@@ -875,6 +887,7 @@ impl VdafOps {
                 upload_decrypt_failure_counter,
                 upload_decode_failure_counter,
                 task,
+                report_id,
                 report,
             )
             .await,
@@ -888,6 +901,7 @@ impl VdafOps {
                     upload_decrypt_failure_counter,
                     upload_decode_failure_counter,
                     task,
+                    report_id,
                     report,
                 )
                 .await
@@ -1173,6 +1187,7 @@ impl VdafOps {
         upload_decrypt_failure_counter: &Counter<u64>,
         upload_decode_failure_counter: &Counter<u64>,
         task: &Task,
+        report_id: &ReportId,
         report: Report,
     ) -> Result<(), Error>
     where
@@ -1189,7 +1204,7 @@ impl VdafOps {
         // https://www.ietf.org/archive/id/draft-ietf-ppm-dap-02.html#section-4.3.2
         if report.encrypted_input_shares().len() != 2 {
             return Err(Error::UnrecognizedMessage(
-                Some(*report.task_id()),
+                Some(*task.id()),
                 "unexpected number of encrypted shares in report",
             ));
         }
@@ -1202,10 +1217,7 @@ impl VdafOps {
             .hpke_keys()
             .get(leader_encrypted_input_share.config_id())
             .ok_or_else(|| {
-                Error::OutdatedHpkeConfig(
-                    *report.task_id(),
-                    *leader_encrypted_input_share.config_id(),
-                )
+                Error::OutdatedHpkeConfig(*task.id(), *leader_encrypted_input_share.config_id())
             })?;
 
         let report_deadline = clock.now().add(task.tolerable_clock_skew())?;
@@ -1214,8 +1226,8 @@ impl VdafOps {
         // https://www.ietf.org/archive/id/draft-ietf-ppm-dap-02.html#section-4.3.2
         if report.metadata().time().is_after(&report_deadline) {
             return Err(Error::ReportTooEarly(
-                *report.task_id(),
-                *report.metadata().id(),
+                *task.id(),
+                *report_id,
                 *report.metadata().time(),
             ));
         }
@@ -1224,8 +1236,8 @@ impl VdafOps {
         // https://www.ietf.org/archive/id/draft-ietf-ppm-dap-02.html#section-4.3.2
         if report.metadata().time().is_after(task.task_expiration()) {
             return Err(Error::ReportTooLate(
-                *report.task_id(),
-                *report.metadata().id(),
+                *task.id(),
+                *report_id,
                 *report.metadata().time(),
             ));
         }
@@ -1240,7 +1252,9 @@ impl VdafOps {
                 Ok(public_share) => public_share,
                 Err(err) => {
                     warn!(
-                        report.task_id = %report.task_id(),
+                        report.task_id = %task.id(),
+                        report.id = ?                report_id,
+
                         report.metadata = ?report.metadata(),
                         ?err,
                         "public share decoding failed",
@@ -1255,16 +1269,13 @@ impl VdafOps {
             hpke_private_key,
             &HpkeApplicationInfo::new(&Label::InputShare, &Role::Client, task.role()),
             leader_encrypted_input_share,
-            &associated_data_for_report_share(
-                report.task_id(),
-                report.metadata(),
-                report.public_share(),
-            ),
+            &associated_data_for_report_share(task.id(), report.metadata(), report.public_share()),
         ) {
             Ok(leader_decrypted_input_share) => leader_decrypted_input_share,
             Err(error) => {
                 info!(
-                    report.task_id = %report.task_id(),
+                    report.task_id = %task.id(),
+                    report.id = ?report_id,
                     report.metadata = ?report.metadata(),
                     ?error,
                     "Report decryption failed",
@@ -1281,7 +1292,8 @@ impl VdafOps {
             Ok(leader_input_share) => leader_input_share,
             Err(err) => {
                 warn!(
-                    report.task_id = %report.task_id(),
+                    report.task_id = %task.id(),
+                    report.id = ?report_id,
                     report.metadata = ?report.metadata(),
                     ?err,
                     "Leader input share decoding failed",
@@ -1295,7 +1307,8 @@ impl VdafOps {
             &report.encrypted_input_shares()[Role::Helper.index().unwrap()];
 
         let stored_report = LeaderStoredReport::new(
-            *report.task_id(),
+            *task.id(),
+            *report_id,
             report.metadata().clone(),
             public_share,
             leader_input_share,
@@ -1307,11 +1320,7 @@ impl VdafOps {
                 let (vdaf, stored_report) = (vdaf.clone(), stored_report.clone());
                 Box::pin(async move {
                     let (existing_client_report, conflicting_collect_jobs) = try_join!(
-                        tx.get_client_report(
-                            &vdaf,
-                            stored_report.task_id(),
-                            stored_report.metadata().id()
-                        ),
+                        tx.get_client_report(&vdaf, stored_report.task_id(), stored_report.id()),
                         tx.get_collect_jobs_including_time::<L, A>(
                             stored_report.task_id(),
                             stored_report.metadata().time()
@@ -1324,7 +1333,7 @@ impl VdafOps {
                         return Err(datastore::Error::User(
                             Error::ReportTooLate(
                                 *stored_report.task_id(),
-                                *stored_report.metadata().id(),
+                                *stored_report.id(),
                                 *stored_report.metadata().time(),
                             )
                             .into(),
@@ -1338,7 +1347,7 @@ impl VdafOps {
                         return Err(datastore::Error::User(
                             Error::ReportTooLate(
                                 *stored_report.task_id(),
-                                *stored_report.metadata().id(),
+                                *stored_report.id(),
                                 *stored_report.metadata().time(),
                             )
                             .into(),
@@ -2677,6 +2686,23 @@ where
         .boxed()
 }
 
+fn compose_common_wrappers_hack<F, T>(
+    filter: F,
+    cors: Cors,
+    response_time_histogram: Histogram<f64>,
+    name: &'static str,
+) -> BoxedFilter<(impl Reply,)>
+where
+    F: Filter<Extract = (Result<T, Error>,), Error = Rejection> + Clone + Send + Sync + 'static,
+    T: Reply + 'static,
+{
+    filter
+        .with(warp::wrap_fn(error_handler(response_time_histogram, name)))
+        .with(cors)
+        .with(trace::named(name))
+        .boxed()
+}
+
 /// The number of seconds we send in the Access-Control-Max-Age header. This determines for how
 /// long clients will cache the results of CORS preflight requests. Of popular browsers, Mozilla
 /// Firefox has the highest Max-Age cap, at 24 hours, so we use that. Our CORS preflight handlers
@@ -2727,24 +2753,29 @@ pub fn aggregator_filter<C: Clock>(
         "hpke_config",
     );
 
-    let upload_routing = warp::path("upload");
-    let upload_responding = warp::post()
-        .and(warp::header::exact(
-            CONTENT_TYPE.as_str(),
-            Report::MEDIA_TYPE,
-        ))
-        .and(with_cloned_value(Arc::clone(&aggregator)))
-        .and(warp::body::bytes())
-        .then(|aggregator: Arc<Aggregator<C>>, body: Bytes| async move {
-            aggregator.handle_upload(&body).await?;
-            Ok(StatusCode::OK)
-        });
-    let upload_endpoint = compose_common_wrappers(
-        upload_routing,
-        upload_responding,
+    let upload_endpoint = compose_common_wrappers_hack(
+        warp::put()
+            .and(warp::path!("tasks" / TaskId / "reports" / ReportId))
+            .and(warp::header::exact(
+                CONTENT_TYPE.as_str(),
+                Report::MEDIA_TYPE,
+            ))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
+            .and(warp::body::bytes())
+            .then(
+                |task_id: TaskId,
+                 report_id: ReportId,
+                 aggregator: Arc<Aggregator<C>>,
+                 body: Bytes| async move {
+                    aggregator
+                        .handle_upload(&task_id, &report_id, &body)
+                        .await?;
+                    Ok(StatusCode::OK)
+                },
+            ),
         warp::cors()
             .allow_any_origin()
-            .allow_method("POST")
+            .allow_method("PUT")
             .allow_header("content-type")
             .max_age(CORS_PREFLIGHT_CACHE_AGE)
             .build(),
@@ -3068,10 +3099,11 @@ mod tests {
     };
     use janus_messages::{
         query_type::TimeInterval, AggregateContinueReq, AggregateContinueResp,
-        AggregateInitializeReq, AggregateInitializeResp, AggregateShareReq, AggregateShareResp,
-        BatchSelector, CollectReq, CollectResp, Duration, HpkeCiphertext, HpkeConfig, HpkeConfigId,
-        Interval, PartialBatchSelector, PrepareStep, PrepareStepResult, Query, Report, ReportId,
-        ReportIdChecksum, ReportMetadata, ReportShare, ReportShareError, Role, TaskId, Time,
+        AggregateInitializeReq, AggregateInitializeResp, AggregateReportMetadata,
+        AggregateShareReq, AggregateShareResp, BatchSelector, CollectReq, CollectResp, Duration,
+        HpkeCiphertext, HpkeConfig, HpkeConfigId, Interval, PartialBatchSelector, PrepareStep,
+        PrepareStepResult, Query, Report, ReportId, ReportIdChecksum, ReportShare,
+        ReportShareError, Role, TaskId, Time, UploadReportMetadata,
     };
     use mockito::mock;
     use opentelemetry::global::meter;
@@ -3269,13 +3301,14 @@ mod tests {
         task: &Task,
         datastore: &Datastore<MockClock>,
         report_timestamp: Time,
-    ) -> Report {
+    ) -> (ReportId, Report) {
         assert_eq!(task.vdaf(), &VdafInstance::Prio3Aes128Count);
         datastore.put_task(task).await.unwrap();
 
         let vdaf = Prio3Aes128Count::new_aes128_count(2).unwrap();
         let hpke_key = current_hpke_key(task.hpke_keys());
-        let report_metadata = ReportMetadata::new(random(), report_timestamp, Vec::new());
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(report_timestamp, Vec::new());
 
         let (public_share, measurements) = vdaf.shard(&1).unwrap();
 
@@ -3300,11 +3333,13 @@ mod tests {
         )
         .unwrap();
 
-        Report::new(
-            *task.id(),
-            report_metadata,
-            public_share.get_encoded(),
-            Vec::from([leader_ciphertext, helper_ciphertext]),
+        (
+            report_id,
+            Report::new(
+                report_metadata,
+                public_share.get_encoded(),
+                Vec::from([leader_ciphertext, helper_ciphertext]),
+            ),
         )
     }
 
@@ -3339,12 +3374,17 @@ mod tests {
         let (datastore, _db_handle) = ephemeral_datastore(clock.clone()).await;
         let datastore = Arc::new(datastore);
 
-        let report = setup_report(&task, &datastore, clock.now()).await;
+        let (report_id, report) = setup_report(&task, &datastore, clock.now()).await;
         let filter = aggregator_filter(Arc::clone(&datastore), clock.clone()).unwrap();
 
-        let response = drive_filter(Method::POST, "/upload", &report.get_encoded(), &filter)
-            .await
-            .unwrap();
+        let response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{report_id}", task.id()),
+            &report.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body::to_bytes(response.into_body())
@@ -3354,9 +3394,14 @@ mod tests {
 
         // Verify that we reject duplicate reports with the reportTooLate type.
         // TODO(#34): change this error type.
-        let mut response = drive_filter(Method::POST, "/upload", &report.get_encoded(), &filter)
-            .await
-            .unwrap();
+        let mut response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{report_id}", task.id()),
+            &report.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem_details: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(response.body_mut()).await.unwrap()).unwrap();
@@ -3368,21 +3413,25 @@ mod tests {
                 "title": "Report could not be processed because it arrived too late.",
                 "detail": "Report could not be processed because it arrived too late.",
                 "instance": "..",
-                "taskid": format!("{}", report.task_id()),
+                "taskid": format!("{}", task.id()),
             })
         );
 
         // should reject a report with only one share with the unrecognizedMessage type.
+        let bad_report_id: ReportId = random();
         let bad_report = Report::new(
-            *report.task_id(),
             report.metadata().clone(),
             report.public_share().to_vec(),
             Vec::from([report.encrypted_input_shares()[0].clone()]),
         );
-        let mut response =
-            drive_filter(Method::POST, "/upload", &bad_report.get_encoded(), &filter)
-                .await
-                .unwrap();
+        let mut response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{bad_report_id}", task.id()),
+            &bad_report.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem_details: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(response.body_mut()).await.unwrap()).unwrap();
@@ -3394,7 +3443,7 @@ mod tests {
                 "title": "The message type for a response was incorrect or the payload was malformed.",
                 "detail": "The message type for a response was incorrect or the payload was malformed.",
                 "instance": "..",
-                "taskid": format!("{}", report.task_id()),
+                "taskid": format!("{}", task.id()),
             })
         );
 
@@ -3404,8 +3453,8 @@ mod tests {
             .map(HpkeConfigId::from)
             .find(|id| !task.hpke_keys().contains_key(id))
             .unwrap();
+        let bad_report_id: ReportId = random();
         let bad_report = Report::new(
-            *report.task_id(),
             report.metadata().clone(),
             report.public_share().to_vec(),
             Vec::from([
@@ -3419,10 +3468,14 @@ mod tests {
                 report.encrypted_input_shares()[1].clone(),
             ]),
         );
-        let mut response =
-            drive_filter(Method::POST, "/upload", &bad_report.get_encoded(), &filter)
-                .await
-                .unwrap();
+        let mut response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{bad_report_id}", task.id()),
+            &bad_report.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem_details: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(response.body_mut()).await.unwrap()).unwrap();
@@ -3434,11 +3487,12 @@ mod tests {
                 "title": "The message was generated using an outdated configuration.",
                 "detail": "The message was generated using an outdated configuration.",
                 "instance": "..",
-                "taskid": format!("{}", report.task_id()),
+                "taskid": format!("{}", task.id()),
             })
         );
 
         // Reports from the future should be rejected.
+        let bad_report_id: ReportId = random();
         let bad_report_time = clock
             .now()
             .add(&Duration::from_minutes(10).unwrap())
@@ -3446,19 +3500,18 @@ mod tests {
             .add(&Duration::from_seconds(1))
             .unwrap();
         let bad_report = Report::new(
-            *report.task_id(),
-            ReportMetadata::new(
-                *report.metadata().id(),
-                bad_report_time,
-                report.metadata().extensions().to_vec(),
-            ),
+            UploadReportMetadata::new(bad_report_time, report.metadata().extensions().to_vec()),
             report.public_share().to_vec(),
             report.encrypted_input_shares().to_vec(),
         );
-        let mut response =
-            drive_filter(Method::POST, "/upload", &bad_report.get_encoded(), &filter)
-                .await
-                .unwrap();
+        let mut response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{bad_report_id}", task.id()),
+            &bad_report.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem_details: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(response.body_mut()).await.unwrap()).unwrap();
@@ -3470,7 +3523,7 @@ mod tests {
                 "title": "Report could not be processed because it arrived too early.",
                 "detail": "Report could not be processed because it arrived too early.",
                 "instance": "..",
-                "taskid": format!("{}", report.task_id()),
+                "taskid": format!("{}", task.id()),
             })
         );
 
@@ -3482,15 +3535,20 @@ mod tests {
         )
         .with_task_expiration(clock.now().add(&Duration::from_seconds(60)).unwrap())
         .build();
-        let report_2 = setup_report(
+        let (report_2_id, report_2) = setup_report(
             &task_expire_soon,
             &datastore,
             clock.now().add(&Duration::from_seconds(120)).unwrap(),
         )
         .await;
-        let mut response = drive_filter(Method::POST, "/upload", &report_2.get_encoded(), &filter)
-            .await
-            .unwrap();
+        let mut response = drive_filter(
+            Method::PUT,
+            &format!("/tasks/{}/reports/{report_2_id}", task_expire_soon.id()),
+            &report_2.get_encoded(),
+            &filter,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem_details: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(response.body_mut()).await.unwrap()).unwrap();
@@ -3502,16 +3560,16 @@ mod tests {
                 "title": "Report could not be processed because it arrived too late.",
                 "detail": "Report could not be processed because it arrived too late.",
                 "instance": "..",
-                "taskid": format!("{}", report_2.task_id()),
+                "taskid": format!("{}", task_expire_soon.id()),
             })
         );
 
         // Check for appropriate CORS headers in response to a preflight request.
         let response = warp::test::request()
             .method("OPTIONS")
-            .path("/upload")
+            .path(&format!("/tasks/{}/reports/{report_id}", task.id()))
             .header("origin", "https://example.com/")
-            .header("access-control-request-method", "POST")
+            .header("access-control-request-method", "PUT")
             .header("access-control-request-headers", "content-type")
             .filter(&filter)
             .await
@@ -3523,7 +3581,7 @@ mod tests {
             headers.get("access-control-allow-origin").unwrap(),
             "https://example.com/"
         );
-        assert_eq!(headers.get("access-control-allow-methods").unwrap(), "POST");
+        assert_eq!(headers.get("access-control-allow-methods").unwrap(), "PUT");
         assert_eq!(
             headers.get("access-control-allow-headers").unwrap(),
             "content-type"
@@ -3532,15 +3590,13 @@ mod tests {
 
         // Check for appropriate CORS headers in response to the main request.
         let response = warp::test::request()
-            .method("POST")
-            .path("/upload")
+            .method("PUT")
+            .path(&format!("/tasks/{}/reports/{}", task.id(), report_id))
             .header("origin", "https://example.com/")
             .header(CONTENT_TYPE, Report::MEDIA_TYPE)
             .body(
                 Report::new(
-                    *report.task_id(),
-                    ReportMetadata::new(
-                        random(),
+                    UploadReportMetadata::new(
                         clock
                             .now()
                             .to_batch_interval_start(task.time_precision())
@@ -3580,13 +3636,13 @@ mod tests {
         let clock = MockClock::default();
         let (datastore, _db_handle) = ephemeral_datastore(clock.clone()).await;
 
-        let report = setup_report(&task, &datastore, clock.now()).await;
+        let (report_id, report) = setup_report(&task, &datastore, clock.now()).await;
 
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let (part, body) = warp::test::request()
-            .method("POST")
-            .path("/upload")
+            .method("PUT")
+            .path(&format!("/tasks/{}/reports/{report_id}", task.id()))
             .header(CONTENT_TYPE, Report::MEDIA_TYPE)
             .body(report.get_encoded())
             .filter(&filter)
@@ -3633,6 +3689,7 @@ mod tests {
         Prio3Aes128Count,
         Aggregator<MockClock>,
         Task,
+        ReportId,
         Report,
         Arc<Datastore<MockClock>>,
         DbHandle,
@@ -3661,7 +3718,7 @@ mod tests {
                 .add(&Duration::from_seconds(1))
                 .unwrap(),
         };
-        let report = setup_report(&task, &datastore, report_timestamp).await;
+        let (report_id, report) = setup_report(&task, &datastore, report_timestamp).await;
 
         let aggregator = Aggregator::new(
             Arc::clone(&datastore),
@@ -3669,38 +3726,39 @@ mod tests {
             meter("janus_aggregator"),
         );
 
-        (vdaf, aggregator, task, report, datastore, db_handle)
+        (
+            vdaf, aggregator, task, report_id, report, datastore, db_handle,
+        )
     }
 
     #[tokio::test]
     async fn upload() {
         install_test_trace_subscriber();
 
-        let (vdaf, aggregator, _, report, datastore, _db_handle) =
+        let (vdaf, aggregator, task, report_id, report, datastore, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::WithinTolerableClockSkew).await;
 
         aggregator
-            .handle_upload(&report.get_encoded())
+            .handle_upload(task.id(), &report_id, &report.get_encoded())
             .await
             .unwrap();
 
         let got_report = datastore
             .run_tx(|tx| {
-                let (vdaf, task_id, report_id) =
-                    (vdaf.clone(), *report.task_id(), *report.metadata().id());
+                let (vdaf, task_id, report_id) = (vdaf.clone(), *task.id(), report_id);
                 Box::pin(async move { tx.get_client_report(&vdaf, &task_id, &report_id).await })
             })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.task_id(), got_report.task_id());
+        assert_eq!(task.id(), got_report.task_id());
         assert_eq!(report.metadata(), got_report.metadata());
 
         // should reject duplicate reports.
         // TODO(#34): change this error type.
-        assert_matches!(aggregator.handle_upload(&report.get_encoded()).await, Err(Error::ReportTooLate(task_id, stale_report_id, stale_time)) => {
-            assert_eq!(&task_id, report.task_id());
-            assert_eq!(report.metadata().id(), &stale_report_id);
+        assert_matches!(aggregator.handle_upload(task.id(), &report_id, &report.get_encoded()).await, Err(Error::ReportTooLate(task_id, stale_report_id, stale_time)) => {
+            assert_eq!(&task_id, task.id());
+            assert_eq!(report_id, stale_report_id);
             assert_eq!(report.metadata().time(), &stale_time);
         });
     }
@@ -3709,18 +3767,19 @@ mod tests {
     async fn upload_wrong_number_of_encrypted_shares() {
         install_test_trace_subscriber();
 
-        let (_, aggregator, _, report, _, _db_handle) =
+        let (_, aggregator, task, report_id, report, _, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::WithinTolerableClockSkew).await;
 
         let report = Report::new(
-            *report.task_id(),
             report.metadata().clone(),
             report.public_share().to_vec(),
             Vec::from([report.encrypted_input_shares()[0].clone()]),
         );
 
         assert_matches!(
-            aggregator.handle_upload(&report.get_encoded()).await,
+            aggregator
+                .handle_upload(task.id(), &report_id, &report.get_encoded())
+                .await,
             Err(Error::UnrecognizedMessage(_, _))
         );
     }
@@ -3729,7 +3788,7 @@ mod tests {
     async fn upload_wrong_hpke_config_id() {
         install_test_trace_subscriber();
 
-        let (_, aggregator, task, report, _, _db_handle) =
+        let (_, aggregator, task, report_id, report, _, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::WithinTolerableClockSkew).await;
 
         let unused_hpke_config_id = (0..)
@@ -3738,7 +3797,6 @@ mod tests {
             .unwrap();
 
         let report = Report::new(
-            *report.task_id(),
             report.metadata().clone(),
             report.public_share().to_vec(),
             Vec::from([
@@ -3753,8 +3811,8 @@ mod tests {
             ]),
         );
 
-        assert_matches!(aggregator.handle_upload(&report.get_encoded()).await, Err(Error::OutdatedHpkeConfig(task_id, config_id)) => {
-            assert_eq!(&task_id, report.task_id());
+        assert_matches!(aggregator.handle_upload(task.id(), &report_id, &report.get_encoded()).await, Err(Error::OutdatedHpkeConfig(task_id, config_id)) => {
+            assert_eq!(task.id(), &task_id);
             assert_eq!(config_id, unused_hpke_config_id);
         });
     }
@@ -3763,24 +3821,23 @@ mod tests {
     async fn upload_report_in_the_future_boundary_condition() {
         install_test_trace_subscriber();
 
-        let (vdaf, aggregator, _, report, datastore, _db_handle) =
+        let (vdaf, aggregator, task, report_id, report, datastore, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::OnClockSkewBoundary).await;
 
         aggregator
-            .handle_upload(&report.get_encoded())
+            .handle_upload(task.id(), &report_id, &report.get_encoded())
             .await
             .unwrap();
 
         let got_report = datastore
             .run_tx(|tx| {
-                let (vdaf, task_id, report_id) =
-                    (vdaf.clone(), *report.task_id(), *report.metadata().id());
+                let (vdaf, task_id, report_id) = (vdaf.clone(), *task.id(), report_id);
                 Box::pin(async move { tx.get_client_report(&vdaf, &task_id, &report_id).await })
             })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.task_id(), got_report.task_id());
+        assert_eq!(task.id(), got_report.task_id());
         assert_eq!(report.metadata(), got_report.metadata());
     }
 
@@ -3788,17 +3845,17 @@ mod tests {
     async fn upload_report_in_the_future_past_clock_skew() {
         install_test_trace_subscriber();
 
-        let (_, aggregator, _, report, _, _db_handle) =
+        let (_, aggregator, task, report_id, report, _, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::PastTolerableClockSkew).await;
 
         let upload_error = aggregator
-            .handle_upload(&report.get_encoded())
+            .handle_upload(task.id(), &report_id, &report.get_encoded())
             .await
             .unwrap_err();
 
-        assert_matches!(upload_error, Error::ReportTooEarly(task_id, report_id, time) => {
-            assert_eq!(&task_id, report.task_id());
-            assert_eq!(report.metadata().id(), &report_id);
+        assert_matches!(upload_error, Error::ReportTooEarly(task_id, got_report_id, time) => {
+            assert_eq!(&task_id, task.id());
+            assert_eq!(report_id, got_report_id);
             assert_eq!(report.metadata().time(), &time);
         });
     }
@@ -3807,7 +3864,7 @@ mod tests {
     async fn upload_report_for_collected_batch() {
         install_test_trace_subscriber();
 
-        let (_, aggregator, task, report, datastore, _db_handle) =
+        let (_, aggregator, task, report_id, report, datastore, _db_handle) =
             setup_upload_test(UploadTestCaseReportTimestamp::WithinTolerableClockSkew).await;
 
         // Insert a collect job for the batch interval including our report.
@@ -3838,9 +3895,9 @@ mod tests {
             .unwrap();
 
         // Try to upload the report, verify that we get the expected error.
-        assert_matches!(aggregator.handle_upload(&report.get_encoded()).await.unwrap_err(), Error::ReportTooLate(err_task_id, err_report_id, err_time) => {
-            assert_eq!(report.task_id(), &err_task_id);
-            assert_eq!(report.metadata().id(), &err_report_id);
+        assert_matches!(aggregator.handle_upload(task.id(), &report_id, &report.get_encoded()).await.unwrap_err(), Error::ReportTooLate(err_task_id, err_report_id, err_time) => {
+            assert_eq!(task.id(), &err_task_id);
+            assert_eq!(report_id, err_report_id);
             assert_eq!(report.metadata().time(), &err_time);
         });
     }
@@ -4036,7 +4093,7 @@ mod tests {
         let hpke_key = current_hpke_key(task.hpke_keys());
 
         // report_share_0 is a "happy path" report.
-        let report_metadata_0 = ReportMetadata::new(
+        let report_metadata_0 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4061,7 +4118,7 @@ mod tests {
         );
 
         // report_share_1 fails decryption.
-        let report_metadata_1 = ReportMetadata::new(
+        let report_metadata_1 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4086,7 +4143,7 @@ mod tests {
         );
 
         // report_share_2 fails decoding due to an issue with the input share.
-        let report_metadata_2 = ReportMetadata::new(
+        let report_metadata_2 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4107,7 +4164,7 @@ mod tests {
         );
 
         // report_share_3 has an unknown HPKE config ID.
-        let report_metadata_3 = ReportMetadata::new(
+        let report_metadata_3 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4131,7 +4188,7 @@ mod tests {
         );
 
         // report_share_4 has already been aggregated.
-        let report_metadata_4 = ReportMetadata::new(
+        let report_metadata_4 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4159,7 +4216,7 @@ mod tests {
         let past_clock = MockClock::new(Time::from_seconds_since_epoch(
             task.time_precision().as_seconds() / 2,
         ));
-        let report_metadata_5 = ReportMetadata::new(
+        let report_metadata_5 = AggregateReportMetadata::new(
             random(),
             past_clock
                 .now()
@@ -4185,7 +4242,7 @@ mod tests {
 
         // report_share_6 fails decoding due to an issue with the public share.
         let public_share_6 = Vec::from([0]);
-        let report_metadata_6 = ReportMetadata::new(
+        let report_metadata_6 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4340,7 +4397,7 @@ mod tests {
 
         let report_share = generate_helper_report_share::<dummy_vdaf::Vdaf>(
             task.id(),
-            &ReportMetadata::new(
+            &AggregateReportMetadata::new(
                 random(),
                 clock
                     .now()
@@ -4417,7 +4474,7 @@ mod tests {
 
         let report_share = generate_helper_report_share::<dummy_vdaf::Vdaf>(
             task.id(),
-            &ReportMetadata::new(
+            &AggregateReportMetadata::new(
                 random(),
                 clock
                     .now()
@@ -4491,7 +4548,7 @@ mod tests {
         datastore.put_task(&task).await.unwrap();
 
         let report_share = ReportShare::new(
-            ReportMetadata::new(
+            AggregateReportMetadata::new(
                 ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
                 Time::from_seconds_since_epoch(54321),
                 Vec::new(),
@@ -4572,7 +4629,7 @@ mod tests {
         let hpke_key = current_hpke_key(task.hpke_keys());
 
         // report_share_0 is a "happy path" report.
-        let report_metadata_0 = ReportMetadata::new(
+        let report_metadata_0 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4607,7 +4664,7 @@ mod tests {
         );
 
         // report_share_1 is omitted by the leader's request.
-        let report_metadata_1 = ReportMetadata::new(
+        let report_metadata_1 = AggregateReportMetadata::new(
             random(),
             clock
                 .now()
@@ -4635,7 +4692,7 @@ mod tests {
         let past_clock = MockClock::new(Time::from_seconds_since_epoch(
             task.time_precision().as_seconds() / 2,
         ));
-        let report_metadata_2 = ReportMetadata::new(
+        let report_metadata_2 = AggregateReportMetadata::new(
             random(),
             past_clock
                 .now()
@@ -4898,7 +4955,7 @@ mod tests {
         let hpke_key = current_hpke_key(task.hpke_keys());
 
         // report_share_0 is a "happy path" report.
-        let report_metadata_0 = ReportMetadata::new(
+        let report_metadata_0 = AggregateReportMetadata::new(
             random(),
             first_batch_interval_clock
                 .now()
@@ -4926,7 +4983,7 @@ mod tests {
 
         // report_share_1 is another "happy path" report to exercise in-memory accumulation of
         // output shares
-        let report_metadata_1 = ReportMetadata::new(
+        let report_metadata_1 = AggregateReportMetadata::new(
             random(),
             first_batch_interval_clock
                 .now()
@@ -4953,7 +5010,7 @@ mod tests {
         );
 
         // report share 2 aggregates successfully, but into a distinct batch aggregation.
-        let report_metadata_2 = ReportMetadata::new(
+        let report_metadata_2 = AggregateReportMetadata::new(
             random(),
             second_batch_interval_clock
                 .now()
@@ -5186,7 +5243,7 @@ mod tests {
         // Aggregate some more reports, which should get accumulated into the
         // batch_aggregations rows created earlier.
         // report_share_3 gets aggreated into the first batch interval.
-        let report_metadata_3 = ReportMetadata::new(
+        let report_metadata_3 = AggregateReportMetadata::new(
             random(),
             first_batch_interval_clock
                 .now()
@@ -5213,7 +5270,7 @@ mod tests {
         );
 
         // report_share_4 gets aggregated into the second batch interval
-        let report_metadata_4 = ReportMetadata::new(
+        let report_metadata_4 = AggregateReportMetadata::new(
             random(),
             second_batch_interval_clock
                 .now()
@@ -5240,7 +5297,7 @@ mod tests {
         );
 
         // report share 5 also gets aggregated into the second batch interval
-        let report_metadata_5 = ReportMetadata::new(
+        let report_metadata_5 = AggregateReportMetadata::new(
             random(),
             second_batch_interval_clock
                 .now()
@@ -5485,7 +5542,7 @@ mod tests {
         let task =
             TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Fake, Role::Helper).build();
         let aggregation_job_id = random();
-        let report_metadata = ReportMetadata::new(
+        let report_metadata = AggregateReportMetadata::new(
             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
@@ -5600,7 +5657,7 @@ mod tests {
         )
         .build();
         let aggregation_job_id = random();
-        let report_metadata = ReportMetadata::new(
+        let report_metadata = AggregateReportMetadata::new(
             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
@@ -5759,7 +5816,7 @@ mod tests {
         let task =
             TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Fake, Role::Helper).build();
         let aggregation_job_id = random();
-        let report_metadata = ReportMetadata::new(
+        let report_metadata = AggregateReportMetadata::new(
             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
@@ -5871,12 +5928,12 @@ mod tests {
         let task =
             TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Fake, Role::Helper).build();
         let aggregation_job_id = random();
-        let report_metadata_0 = ReportMetadata::new(
+        let report_metadata_0 = AggregateReportMetadata::new(
             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
         );
-        let report_metadata_1 = ReportMetadata::new(
+        let report_metadata_1 = AggregateReportMetadata::new(
             ReportId::from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
@@ -6026,7 +6083,7 @@ mod tests {
         let task =
             TaskBuilder::new(QueryType::TimeInterval, VdafInstance::Fake, Role::Helper).build();
         let aggregation_job_id = random();
-        let report_metadata = ReportMetadata::new(
+        let report_metadata = AggregateReportMetadata::new(
             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Time::from_seconds_since_epoch(54321),
             Vec::new(),
@@ -7685,7 +7742,7 @@ mod tests {
 
     fn generate_helper_report_share<V: vdaf::Client>(
         task_id: &TaskId,
-        report_metadata: &ReportMetadata,
+        report_metadata: &AggregateReportMetadata,
         cfg: &HpkeConfig,
         public_share: &V::PublicShare,
         input_share: &V::InputShare,
@@ -7706,7 +7763,7 @@ mod tests {
     }
 
     fn generate_helper_report_share_for_plaintext(
-        metadata: ReportMetadata,
+        metadata: AggregateReportMetadata,
         cfg: &HpkeConfig,
         encoded_public_share: Vec<u8>,
         plaintext: &[u8],

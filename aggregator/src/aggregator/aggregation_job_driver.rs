@@ -17,8 +17,8 @@ use janus_core::{task::VdafInstance, time::Clock};
 use janus_messages::{
     query_type::{FixedSize, QueryType, TimeInterval},
     AggregateContinueReq, AggregateContinueResp, AggregateInitializeReq, AggregateInitializeResp,
-    Duration, PartialBatchSelector, PrepareStep, PrepareStepResult, ReportShare, ReportShareError,
-    Role,
+    AggregateReportMetadata, Duration, PartialBatchSelector, PrepareStep, PrepareStepResult,
+    ReportShare, ReportShareError, Role,
 };
 use opentelemetry::{
     metrics::{Counter, Histogram, Meter, Unit},
@@ -327,10 +327,7 @@ impl AggregationJobDriver {
             .zip(client_reports.into_iter())
             .inspect(|(report_aggregation, client_report)| {
                 assert_eq!(report_aggregation.task_id(), client_report.task_id());
-                assert_eq!(
-                    report_aggregation.report_id(),
-                    client_report.metadata().id()
-                );
+                assert_eq!(report_aggregation.report_id(), client_report.id());
             })
             .collect();
 
@@ -345,7 +342,7 @@ impl AggregationJobDriver {
                 verify_key.as_bytes(),
                 Role::Leader.index().unwrap(),
                 aggregation_job.aggregation_parameter(),
-                &report.metadata().id().get_encoded(),
+                &report.id().get_encoded(),
                 report.public_share(),
                 report.leader_input_share(),
             ) {
@@ -365,7 +362,11 @@ impl AggregationJobDriver {
             };
 
             report_shares.push(ReportShare::new(
-                report.metadata().clone(),
+                AggregateReportMetadata::new(
+                    *report.id(),
+                    *report.metadata().time(),
+                    report.metadata().extensions().to_vec(),
+                ),
                 report.public_share().get_encoded(),
                 report.helper_encrypted_input_share().clone(),
             ));
@@ -886,8 +887,9 @@ mod tests {
     use janus_messages::{
         query_type::{FixedSize, TimeInterval},
         AggregateContinueReq, AggregateContinueResp, AggregateInitializeReq,
-        AggregateInitializeResp, Duration, HpkeConfig, Interval, PartialBatchSelector, PrepareStep,
-        PrepareStepResult, ReportIdChecksum, ReportMetadata, ReportShare, Role, TaskId,
+        AggregateInitializeResp, AggregateReportMetadata, Duration, HpkeConfig, Interval,
+        PartialBatchSelector, PrepareStep, PrepareStepResult, ReportId, ReportIdChecksum,
+        ReportShare, Role, TaskId, UploadReportMetadata,
     };
     use mockito::mock;
     use opentelemetry::global::meter;
@@ -929,8 +931,8 @@ mod tests {
         ]))
         .build();
 
-        let report_metadata = ReportMetadata::new(
-            random(),
+        let report_id: ReportId = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -940,19 +942,14 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let agg_auth_token = task.primary_aggregator_auth_token().clone();
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -985,7 +982,7 @@ mod tests {
                 >::new(
                     *task.id(),
                     aggregation_job_id,
-                    *report.metadata().id(),
+                    report_id,
                     *report.metadata().time(),
                     0,
                     ReportAggregationState::Start,
@@ -1005,7 +1002,7 @@ mod tests {
                 AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
                 AggregateInitializeResp::MEDIA_TYPE,
                 AggregateInitializeResp::new(Vec::from([PrepareStep::new(
-                    *report.metadata().id(),
+                    report_id,
                     PrepareStepResult::Continued(helper_vdaf_msg.get_encoded()),
                 )]))
                 .get_encoded(),
@@ -1014,7 +1011,7 @@ mod tests {
                 AggregateContinueReq::MEDIA_TYPE,
                 AggregateContinueResp::MEDIA_TYPE,
                 AggregateContinueResp::new(Vec::from([PrepareStep::new(
-                    *report.metadata().id(),
+                    report_id,
                     PrepareStepResult::Finished,
                 )]))
                 .get_encoded(),
@@ -1086,7 +1083,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                report_id,
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Finished(leader_output_share),
@@ -1095,7 +1092,7 @@ mod tests {
         let (got_aggregation_job, got_report_aggregation) = ds
             .run_tx(|tx| {
                 let (vdaf, task, report_id) =
-                    (Arc::clone(&vdaf), task.clone(), *report.metadata().id());
+                    (Arc::clone(&vdaf), task.clone(), *report.id());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, TimeInterval, Prio3Aes128Count>(
@@ -1144,8 +1141,8 @@ mod tests {
         ]))
         .build();
 
-        let report_metadata = ReportMetadata::new(
-            random(),
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -1155,19 +1152,14 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let agg_auth_token = task.primary_aggregator_auth_token();
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -1200,7 +1192,7 @@ mod tests {
                     >::new(
                         *task.id(),
                         aggregation_job_id,
-                        *report.metadata().id(),
+                        *report.id(),
                         *report.metadata().time(),
                         0,
                         ReportAggregationState::Start,
@@ -1228,7 +1220,11 @@ mod tests {
             ().get_encoded(),
             PartialBatchSelector::new_time_interval(),
             Vec::from([ReportShare::new(
-                report.metadata().clone(),
+                AggregateReportMetadata::new(
+                    report_id,
+                    *report.metadata().time(),
+                    report.metadata().extensions().to_vec(),
+                ),
                 report.public_share().get_encoded(),
                 report.helper_encrypted_input_share().clone(),
             )]),
@@ -1237,7 +1233,7 @@ mod tests {
             &transcript.prepare_transitions[Role::Helper.index().unwrap()][0],
             PrepareTransition::Continue(_, prep_share) => prep_share);
         let helper_response = AggregateInitializeResp::new(Vec::from([PrepareStep::new(
-            *report.metadata().id(),
+            *report.id(),
             PrepareStepResult::Continued(helper_vdaf_msg.get_encoded()),
         )]));
         let mocked_aggregate_failure = mock("POST", "/aggregate")
@@ -1300,7 +1296,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                *report.id(),
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Waiting(leader_prep_state, Some(prep_msg)),
@@ -1309,7 +1305,7 @@ mod tests {
         let (got_aggregation_job, got_report_aggregation) = ds
             .run_tx(|tx| {
                 let (vdaf, task, report_id) =
-                    (Arc::clone(&vdaf), task.clone(), *report.metadata().id());
+                    (Arc::clone(&vdaf), task.clone(), *report.id());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, TimeInterval, Prio3Aes128Count>(
@@ -1358,8 +1354,8 @@ mod tests {
         ]))
         .build();
 
-        let report_metadata = ReportMetadata::new(
-            random(),
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -1369,19 +1365,14 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let agg_auth_token = task.primary_aggregator_auth_token();
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -1415,7 +1406,7 @@ mod tests {
                     >::new(
                         *task.id(),
                         aggregation_job_id,
-                        *report.metadata().id(),
+                        *report.id(),
                         *report.metadata().time(),
                         0,
                         ReportAggregationState::Start,
@@ -1443,7 +1434,11 @@ mod tests {
             ().get_encoded(),
             PartialBatchSelector::new_fixed_size(batch_id),
             Vec::from([ReportShare::new(
-                report.metadata().clone(),
+                AggregateReportMetadata::new(
+                    *report.id(),
+                    *report.metadata().time(),
+                    report.metadata().extensions().to_vec(),
+                ),
                 report.public_share().get_encoded(),
                 report.helper_encrypted_input_share().clone(),
             )]),
@@ -1452,7 +1447,7 @@ mod tests {
             &transcript.prepare_transitions[Role::Helper.index().unwrap()][0],
             PrepareTransition::Continue(_, prep_share) => prep_share);
         let helper_response = AggregateInitializeResp::new(Vec::from([PrepareStep::new(
-            *report.metadata().id(),
+            *report.id(),
             PrepareStepResult::Continued(helper_vdaf_msg.get_encoded()),
         )]));
         let mocked_aggregate_failure = mock("POST", "/aggregate")
@@ -1515,7 +1510,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                *report.id(),
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Waiting(leader_prep_state, Some(prep_msg)),
@@ -1524,7 +1519,7 @@ mod tests {
         let (got_aggregation_job, got_report_aggregation) = ds
             .run_tx(|tx| {
                 let (vdaf, task, report_id) =
-                    (Arc::clone(&vdaf), task.clone(), *report.metadata().id());
+                    (Arc::clone(&vdaf), task.clone(), *report.id());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, FixedSize, Prio3Aes128Count>(
@@ -1573,8 +1568,9 @@ mod tests {
             Url::parse(&mockito::server_url()).unwrap(),
         ]))
         .build();
-        let report_metadata = ReportMetadata::new(
-            random(),
+
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -1584,19 +1580,14 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let agg_auth_token = task.primary_aggregator_auth_token();
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -1643,7 +1634,7 @@ mod tests {
                     >::new(
                         *task.id(),
                         aggregation_job_id,
-                        *report.metadata().id(),
+                        *report.id(),
                         *report.metadata().time(),
                         0,
                         ReportAggregationState::Waiting(leader_prep_state, Some(prep_msg)),
@@ -1669,12 +1660,12 @@ mod tests {
             *task.id(),
             aggregation_job_id,
             Vec::from([PrepareStep::new(
-                *report.metadata().id(),
+                *report.id(),
                 PrepareStepResult::Continued(prep_msg.get_encoded()),
             )]),
         );
         let helper_response = AggregateContinueResp::new(Vec::from([PrepareStep::new(
-            *report.metadata().id(),
+            *report.id(),
             PrepareStepResult::Finished,
         )]));
         let mocked_aggregate_failure = mock("POST", "/aggregate")
@@ -1733,7 +1724,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                *report.id(),
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Finished(leader_output_share),
@@ -1753,12 +1744,12 @@ mod tests {
             (),
             leader_aggregate_share,
             1,
-            ReportIdChecksum::for_report_id(report.metadata().id()),
+            ReportIdChecksum::for_report_id(report.id()),
         )]);
 
         let (got_aggregation_job, got_report_aggregation, got_batch_aggregations) = ds
             .run_tx(|tx| {
-                let (vdaf, task, report_metadata) = (Arc::clone(&vdaf), task.clone(), report.metadata().clone());
+                let (vdaf, task, report) = (Arc::clone(&vdaf), task.clone(), report.clone());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, TimeInterval, Prio3Aes128Count>(
@@ -1773,7 +1764,7 @@ mod tests {
                             &Role::Leader,
                             task.id(),
                             &aggregation_job_id,
-                            report_metadata.id(),
+                            report.id(),
                         )
                         .await?
                         .unwrap();
@@ -1781,7 +1772,7 @@ mod tests {
                         tx,
                         &task,
                         &Interval::new(
-                            report_metadata.time().to_batch_interval_start(task.time_precision()).unwrap(),
+                            report.metadata().time().to_batch_interval_start(task.time_precision()).unwrap(),
                             *task.time_precision()).unwrap(),
                         &(),
                     ).await.unwrap();
@@ -1816,8 +1807,9 @@ mod tests {
             Url::parse(&mockito::server_url()).unwrap(),
         ]))
         .build();
-        let report_metadata = ReportMetadata::new(
-            random(),
+
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -1827,19 +1819,14 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let agg_auth_token = task.primary_aggregator_auth_token();
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -1887,7 +1874,7 @@ mod tests {
                     >::new(
                         *task.id(),
                         aggregation_job_id,
-                        *report.metadata().id(),
+                        *report.id(),
                         *report.metadata().time(),
                         0,
                         ReportAggregationState::Waiting(leader_prep_state, Some(prep_msg)),
@@ -1913,12 +1900,12 @@ mod tests {
             *task.id(),
             aggregation_job_id,
             Vec::from([PrepareStep::new(
-                *report.metadata().id(),
+                *report.id(),
                 PrepareStepResult::Continued(prep_msg.get_encoded()),
             )]),
         );
         let helper_response = AggregateContinueResp::new(Vec::from([PrepareStep::new(
-            *report.metadata().id(),
+            *report.id(),
             PrepareStepResult::Finished,
         )]));
         let mocked_aggregate_failure = mock("POST", "/aggregate")
@@ -1977,7 +1964,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                *report.id(),
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Finished(leader_output_share),
@@ -1992,12 +1979,12 @@ mod tests {
             (),
             leader_aggregate_share,
             1,
-            ReportIdChecksum::for_report_id(report.metadata().id()),
+            ReportIdChecksum::for_report_id(report.id()),
         )]);
 
         let (got_aggregation_job, got_report_aggregation, got_batch_aggregations) = ds
             .run_tx(|tx| {
-                let (vdaf, task, report_metadata) = (Arc::clone(&vdaf), task.clone(), report.metadata().clone());
+                let (vdaf, task, report) = (Arc::clone(&vdaf), task.clone(), report.clone());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, FixedSize, Prio3Aes128Count>(
@@ -2012,7 +1999,7 @@ mod tests {
                             &Role::Leader,
                             task.id(),
                             &aggregation_job_id,
-                            report_metadata.id(),
+                            report.id(),
                         )
                         .await?
                         .unwrap();
@@ -2052,8 +2039,9 @@ mod tests {
             Url::parse(&mockito::server_url()).unwrap(),
         ]))
         .build();
-        let report_metadata = ReportMetadata::new(
-            random(),
+
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
@@ -2063,18 +2051,13 @@ mod tests {
         let verify_key: VerifyKey<PRIO3_AES128_VERIFY_KEY_LENGTH> =
             task.primary_vdaf_verify_key().unwrap();
 
-        let transcript = run_vdaf(
-            vdaf.as_ref(),
-            verify_key.as_bytes(),
-            &(),
-            report_metadata.id(),
-            &0,
-        );
+        let transcript = run_vdaf(vdaf.as_ref(), verify_key.as_bytes(), &(), &report_id, &0);
 
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -2094,7 +2077,7 @@ mod tests {
             ReportAggregation::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::new(
                 *task.id(),
                 aggregation_job_id,
-                *report.metadata().id(),
+                *report.id(),
                 *report.metadata().time(),
                 0,
                 ReportAggregationState::Start,
@@ -2143,7 +2126,7 @@ mod tests {
         let (got_aggregation_job, got_report_aggregation, got_leases) = ds
             .run_tx(|tx| {
                 let (vdaf, task, report_id) =
-                    (Arc::clone(&vdaf), task.clone(), *report.metadata().id());
+                    (Arc::clone(&vdaf), task.clone(), *report.id());
                 Box::pin(async move {
                     let aggregation_job = tx
                         .get_aggregation_job::<PRIO3_AES128_VERIFY_KEY_LENGTH, TimeInterval, Prio3Aes128Count>(
@@ -2179,7 +2162,8 @@ mod tests {
     /// input shares corresponding to the given HPKE configs & input shares.
     fn generate_report<const L: usize, A>(
         task_id: &TaskId,
-        report_metadata: &ReportMetadata,
+        report_id: &ReportId,
+        report_metadata: &UploadReportMetadata,
         helper_hpke_config: &HpkeConfig,
         public_share: &A::PublicShare,
         input_shares: &[A::InputShare],
@@ -2209,6 +2193,7 @@ mod tests {
 
         LeaderStoredReport::new(
             *task_id,
+            *report_id,
             report_metadata.clone(),
             public_share.clone(),
             input_shares
@@ -2245,18 +2230,20 @@ mod tests {
         let (helper_hpke_config, _) = generate_test_hpke_config_and_private_key();
 
         let vdaf = Prio3::new_aes128_count(2).unwrap();
-        let report_metadata = ReportMetadata::new(
-            random(),
+
+        let report_id = random();
+        let report_metadata = UploadReportMetadata::new(
             clock
                 .now()
                 .to_batch_interval_start(task.time_precision())
                 .unwrap(),
             Vec::new(),
         );
-        let transcript = run_vdaf(&vdaf, verify_key.as_bytes(), &(), report_metadata.id(), &0);
+        let transcript = run_vdaf(&vdaf, verify_key.as_bytes(), &(), &report_id, &0);
         let report: LeaderStoredReport<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count> =
             generate_report(
                 task.id(),
+                &report_id,
                 &report_metadata,
                 &helper_hpke_config,
                 &transcript.public_share,
@@ -2293,7 +2280,7 @@ mod tests {
                 >::new(
                     *task.id(),
                     aggregation_job_id,
-                    *report.metadata().id(),
+                    *report.id(),
                     *report.metadata().time(),
                     0,
                     ReportAggregationState::Start,
