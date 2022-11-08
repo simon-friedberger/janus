@@ -817,27 +817,17 @@ impl Decode for HpkeConfig {
     }
 }
 
-/// DAP protocol message representing client report metadata.
+/// DAP protocol message representing client report metadata in the upload sub-protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReportMetadata {
-    report_id: ReportId,
+pub struct UploadReportMetadata {
     time: Time,
     extensions: Vec<Extension>,
 }
 
-impl ReportMetadata {
+impl UploadReportMetadata {
     /// Construct a report's metadata from its components.
-    pub fn new(report_id: ReportId, time: Time, extensions: Vec<Extension>) -> Self {
-        Self {
-            report_id,
-            time,
-            extensions,
-        }
-    }
-
-    /// Retrieve the report ID from this report metadata.
-    pub fn id(&self) -> &ReportId {
-        &self.report_id
+    pub fn new(time: Time, extensions: Vec<Extension>) -> Self {
+        Self { time, extensions }
     }
 
     /// Retrieve the client timestamp from this report metadata.
@@ -851,33 +841,26 @@ impl ReportMetadata {
     }
 }
 
-impl Encode for ReportMetadata {
+impl Encode for UploadReportMetadata {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.report_id.encode(bytes);
         self.time.encode(bytes);
         encode_u16_items(bytes, &(), &self.extensions);
     }
 }
 
-impl Decode for ReportMetadata {
+impl Decode for UploadReportMetadata {
     fn decode(bytes: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let report_id = ReportId::decode(bytes)?;
         let time = Time::decode(bytes)?;
         let extensions = decode_u16_items(&(), bytes)?;
 
-        Ok(Self {
-            report_id,
-            time,
-            extensions,
-        })
+        Ok(Self { time, extensions })
     }
 }
 
 /// DAP protocol message representing a client report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
-    task_id: TaskId,
-    metadata: ReportMetadata,
+    metadata: UploadReportMetadata,
     public_share: Vec<u8>,
     encrypted_input_shares: Vec<HpkeCiphertext>,
 }
@@ -888,26 +871,19 @@ impl Report {
 
     /// Construct a report from its components.
     pub fn new(
-        task_id: TaskId,
-        metadata: ReportMetadata,
+        metadata: UploadReportMetadata,
         public_share: Vec<u8>,
         encrypted_input_shares: Vec<HpkeCiphertext>,
     ) -> Self {
         Self {
-            task_id,
             metadata,
             public_share,
             encrypted_input_shares,
         }
     }
 
-    /// Retrieve the task identifier from this report.
-    pub fn task_id(&self) -> &TaskId {
-        &self.task_id
-    }
-
     /// Retrieve the metadata from this report.
-    pub fn metadata(&self) -> &ReportMetadata {
+    pub fn metadata(&self) -> &UploadReportMetadata {
         &self.metadata
     }
 
@@ -923,7 +899,6 @@ impl Report {
 
 impl Encode for Report {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.task_id.encode(bytes);
         self.metadata.encode(bytes);
         encode_u32_items(bytes, &(), &self.public_share);
         encode_u32_items(bytes, &(), &self.encrypted_input_shares);
@@ -932,13 +907,11 @@ impl Encode for Report {
 
 impl Decode for Report {
     fn decode(bytes: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let task_id = TaskId::decode(bytes)?;
-        let metadata = ReportMetadata::decode(bytes)?;
+        let metadata = UploadReportMetadata::decode(bytes)?;
         let public_share = decode_u32_items(&(), bytes)?;
         let encrypted_input_shares = decode_u32_items(&(), bytes)?;
 
         Ok(Self {
-            task_id,
             metadata,
             public_share,
             encrypted_input_shares,
@@ -1312,7 +1285,7 @@ pub mod query_type {
 #[derive(Derivative, Clone, PartialEq, Eq)]
 #[derivative(Debug)]
 pub struct ReportShare {
-    metadata: ReportMetadata,
+    metadata: AggregateReportMetadata,
     #[derivative(Debug = "ignore")]
     public_share: Vec<u8>,
     encrypted_input_share: HpkeCiphertext,
@@ -1321,7 +1294,7 @@ pub struct ReportShare {
 impl ReportShare {
     /// Constructs a new report share from its components.
     pub fn new(
-        metadata: ReportMetadata,
+        metadata: AggregateReportMetadata,
         public_share: Vec<u8>,
         encrypted_input_share: HpkeCiphertext,
     ) -> Self {
@@ -1333,7 +1306,7 @@ impl ReportShare {
     }
 
     /// Gets the metadata associated with this report share.
-    pub fn metadata(&self) -> &ReportMetadata {
+    pub fn metadata(&self) -> &AggregateReportMetadata {
         &self.metadata
     }
 
@@ -1358,7 +1331,7 @@ impl Encode for ReportShare {
 
 impl Decode for ReportShare {
     fn decode(bytes: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let metadata = ReportMetadata::decode(bytes)?;
+        let metadata = AggregateReportMetadata::decode(bytes)?;
         let public_share = decode_u32_items(&(), bytes)?;
         let encrypted_input_share = HpkeCiphertext::decode(bytes)?;
 
@@ -1531,6 +1504,62 @@ impl Decode for AggregationJobId {
 impl Distribution<AggregationJobId> for Standard {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> AggregationJobId {
         AggregationJobId(rng.gen())
+    }
+}
+
+/// DAP protocol message representing client report metadata in the aggregate sub-protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregateReportMetadata {
+    report_id: ReportId,
+    time: Time,
+    extensions: Vec<Extension>,
+}
+
+impl AggregateReportMetadata {
+    /// Construct a report's metadata from its components.
+    pub fn new(report_id: ReportId, time: Time, extensions: Vec<Extension>) -> Self {
+        Self {
+            report_id,
+            time,
+            extensions,
+        }
+    }
+
+    /// Retrieve the report ID from this report metadata.
+    pub fn id(&self) -> &ReportId {
+        &self.report_id
+    }
+
+    /// Retrieve the client timestamp from this report metadata.
+    pub fn time(&self) -> &Time {
+        &self.time
+    }
+
+    /// Retrieve the extensions from this report metadata.
+    pub fn extensions(&self) -> &[Extension] {
+        &self.extensions
+    }
+}
+
+impl Encode for AggregateReportMetadata {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.report_id.encode(bytes);
+        self.time.encode(bytes);
+        encode_u16_items(bytes, &(), &self.extensions);
+    }
+}
+
+impl Decode for AggregateReportMetadata {
+    fn decode(bytes: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+        let report_id = ReportId::decode(bytes)?;
+        let time = Time::decode(bytes)?;
+        let extensions = decode_u16_items(&(), bytes)?;
+
+        Ok(Self {
+            report_id,
+            time,
+            extensions,
+        })
     }
 }
 
@@ -1946,11 +1975,12 @@ mod tests {
     use crate::{
         query_type::{self, FixedSize, TimeInterval},
         AggregateContinueReq, AggregateContinueResp, AggregateInitializeReq,
-        AggregateInitializeResp, AggregateShareReq, AggregateShareResp, AggregationJobId, BatchId,
-        BatchSelector, CollectReq, CollectResp, Duration, Extension, ExtensionType, HpkeAeadId,
-        HpkeCiphertext, HpkeConfig, HpkeConfigId, HpkeKdfId, HpkeKemId, HpkePublicKey, Interval,
-        PartialBatchSelector, PrepareStep, PrepareStepResult, Query, Report, ReportId,
-        ReportIdChecksum, ReportMetadata, ReportShare, ReportShareError, Role, TaskId, Time,
+        AggregateInitializeResp, AggregateReportMetadata, AggregateShareReq, AggregateShareResp,
+        AggregationJobId, BatchId, BatchSelector, CollectReq, CollectResp, Duration, Extension,
+        ExtensionType, HpkeAeadId, HpkeCiphertext, HpkeConfig, HpkeConfigId, HpkeKdfId, HpkeKemId,
+        HpkePublicKey, Interval, PartialBatchSelector, PrepareStep, PrepareStepResult, Query,
+        Report, ReportId, ReportIdChecksum, ReportShare, ReportShareError, Role, TaskId, Time,
+        UploadReportMetadata,
     };
     use assert_matches::assert_matches;
     use prio::codec::{CodecError, Decode, Encode};
@@ -2294,14 +2324,9 @@ mod tests {
     fn roundtrip_report_metadata() {
         roundtrip_encoding(&[
             (
-                ReportMetadata::new(
-                    ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
-                    Time::from_seconds_since_epoch(12345),
-                    Vec::new(),
-                ),
+                UploadReportMetadata::new(Time::from_seconds_since_epoch(12345), Vec::new()),
                 concat!(
-                    "0102030405060708090A0B0C0D0E0F10", // report_id
-                    "0000000000003039",                 // time
+                    "0000000000003039", // time
                     concat!(
                         // extensions
                         "0000", // length
@@ -2309,14 +2334,12 @@ mod tests {
                 ),
             ),
             (
-                ReportMetadata::new(
-                    ReportId::from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+                UploadReportMetadata::new(
                     Time::from_seconds_since_epoch(54321),
                     Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("0123"))]),
                 ),
                 concat!(
-                    "100F0E0D0C0B0A090807060504030201", // report_id
-                    "000000000000D431",                 // time
+                    "000000000000D431", // time
                     concat!(
                         // extensions
                         "0008", // length
@@ -2339,21 +2362,14 @@ mod tests {
         roundtrip_encoding(&[
             (
                 Report::new(
-                    TaskId::from([u8::MIN; TaskId::LEN]),
-                    ReportMetadata::new(
-                        ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
-                        Time::from_seconds_since_epoch(12345),
-                        Vec::new(),
-                    ),
+                    UploadReportMetadata::new(Time::from_seconds_since_epoch(12345), Vec::new()),
                     Vec::new(),
                     Vec::new(),
                 ),
                 concat!(
-                    "0000000000000000000000000000000000000000000000000000000000000000", // task_id
                     concat!(
                         // metadata
-                        "0102030405060708090A0B0C0D0E0F10", // report_id
-                        "0000000000003039",                 // time
+                        "0000000000003039", // time
                         concat!(
                             // extensions
                             "0000", // length
@@ -2371,9 +2387,7 @@ mod tests {
             ),
             (
                 Report::new(
-                    TaskId::from([u8::MAX; TaskId::LEN]),
-                    ReportMetadata::new(
-                        ReportId::from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+                    UploadReportMetadata::new(
                         Time::from_seconds_since_epoch(54321),
                         Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("0123"))]),
                     ),
@@ -2392,11 +2406,9 @@ mod tests {
                     ]),
                 ),
                 concat!(
-                    "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", // task_id
                     concat!(
                         // metadata
-                        "100F0E0D0C0B0A090807060504030201", // report_id
-                        "000000000000D431",                 // time
+                        "000000000000D431", // time
                         concat!(
                             // extensions
                             "0008", // length
@@ -2919,7 +2931,7 @@ mod tests {
                 partial_batch_selector: PartialBatchSelector::new_time_interval(),
                 report_shares: Vec::from([
                     ReportShare {
-                        metadata: ReportMetadata::new(
+                        metadata: AggregateReportMetadata::new(
                             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
                             Time::from_seconds_since_epoch(54321),
                             Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("0123"))]),
@@ -2932,7 +2944,7 @@ mod tests {
                         ),
                     },
                     ReportShare {
-                        metadata: ReportMetadata::new(
+                        metadata: AggregateReportMetadata::new(
                             ReportId::from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
                             Time::from_seconds_since_epoch(73542),
                             Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("3210"))]),
@@ -3051,7 +3063,7 @@ mod tests {
                 )),
                 report_shares: Vec::from([
                     ReportShare {
-                        metadata: ReportMetadata::new(
+                        metadata: AggregateReportMetadata::new(
                             ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
                             Time::from_seconds_since_epoch(54321),
                             Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("0123"))]),
@@ -3064,7 +3076,7 @@ mod tests {
                         ),
                     },
                     ReportShare {
-                        metadata: ReportMetadata::new(
+                        metadata: AggregateReportMetadata::new(
                             ReportId::from([16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
                             Time::from_seconds_since_epoch(73542),
                             Vec::from([Extension::new(ExtensionType::Tbd, Vec::from("3210"))]),
