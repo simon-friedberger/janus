@@ -1020,7 +1020,6 @@ impl<Q: QueryType> Decode for Query<Q> {
 #[derive(Clone, Derivative, PartialEq, Eq)]
 #[derivative(Debug)]
 pub struct CollectReq<Q: QueryType> {
-    task_id: TaskId,
     query: Query<Q>,
     #[derivative(Debug = "ignore")]
     aggregation_parameter: Vec<u8>,
@@ -1031,17 +1030,11 @@ impl<Q: QueryType> CollectReq<Q> {
     pub const MEDIA_TYPE: &'static str = "application/dap-collect-req";
 
     /// Constructs a new collect request from its components.
-    pub fn new(task_id: TaskId, query: Query<Q>, aggregation_parameter: Vec<u8>) -> Self {
+    pub fn new(query: Query<Q>, aggregation_parameter: Vec<u8>) -> Self {
         Self {
-            task_id,
             query,
             aggregation_parameter,
         }
-    }
-
-    /// Gets the task ID associated with this collect request.
-    pub fn task_id(&self) -> &TaskId {
-        &self.task_id
     }
 
     /// Gets the query associated with this collect request.
@@ -1057,7 +1050,6 @@ impl<Q: QueryType> CollectReq<Q> {
 
 impl<Q: QueryType> Encode for CollectReq<Q> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.task_id.encode(bytes);
         self.query.encode(bytes);
         encode_u16_items(bytes, &(), &self.aggregation_parameter);
     }
@@ -1065,12 +1057,10 @@ impl<Q: QueryType> Encode for CollectReq<Q> {
 
 impl<Q: QueryType> Decode for CollectReq<Q> {
     fn decode(bytes: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let task_id = TaskId::decode(bytes)?;
         let query = Query::decode(bytes)?;
         let aggregation_parameter = decode_u16_items(&(), bytes)?;
 
         Ok(Self {
-            task_id,
             query,
             aggregation_parameter,
         })
@@ -2560,7 +2550,6 @@ mod tests {
         roundtrip_encoding(&[
             (
                 CollectReq::<TimeInterval> {
-                    task_id: TaskId::from([u8::MIN; 32]),
                     query: Query {
                         batch_identifier: Interval::new(
                             Time::from_seconds_since_epoch(54321),
@@ -2571,7 +2560,6 @@ mod tests {
                     aggregation_parameter: Vec::new(),
                 },
                 concat!(
-                    "0000000000000000000000000000000000000000000000000000000000000000", // task_id,
                     concat!(
                         // query
                         "01", // query_type
@@ -2590,7 +2578,6 @@ mod tests {
             ),
             (
                 CollectReq::<TimeInterval> {
-                    task_id: TaskId::from([13u8; 32]),
                     query: Query {
                         batch_identifier: Interval::new(
                             Time::from_seconds_since_epoch(48913),
@@ -2601,7 +2588,6 @@ mod tests {
                     aggregation_parameter: Vec::from("012345"),
                 },
                 concat!(
-                    "0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D", // task_id
                     concat!(
                         // query
                         "01", // query_type
@@ -2624,14 +2610,12 @@ mod tests {
         roundtrip_encoding(&[
             (
                 CollectReq::<FixedSize> {
-                    task_id: TaskId::from([u8::MIN; 32]),
                     query: Query {
                         batch_identifier: BatchId::from([10u8; 32]),
                     },
                     aggregation_parameter: Vec::new(),
                 },
                 concat!(
-                    "0000000000000000000000000000000000000000000000000000000000000000", // task_id,
                     concat!(
                         // query
                         "02", // query_type
@@ -2646,14 +2630,12 @@ mod tests {
             ),
             (
                 CollectReq::<FixedSize> {
-                    task_id: TaskId::from([13u8; 32]),
                     query: Query {
                         batch_identifier: BatchId::from([8u8; 32]),
                     },
                     aggregation_parameter: Vec::from("012345"),
                 },
                 concat!(
-                    "0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D0D", // task_id
                     concat!(
                         // query
                         "02", // query_type

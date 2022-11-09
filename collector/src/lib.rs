@@ -195,8 +195,10 @@ impl CollectorParameters {
     }
 
     /// URL for collect requests.
-    fn collect_endpoint(&self) -> Result<Url, Error> {
-        Ok(self.leader_endpoint.join("collect")?)
+    fn collections_resource_uri(&self) -> Result<Url, Error> {
+        Ok(self
+            .leader_endpoint
+            .join(&format!("tasks/{}/collections", self.task_id))?)
     }
 }
 
@@ -324,18 +326,17 @@ where
         aggregation_parameter: &V::AggregationParam,
     ) -> Result<CollectJob<V::AggregationParam>, Error> {
         let collect_request = CollectReq::new(
-            self.parameters.task_id,
             Query::new_time_interval(batch_interval),
             aggregation_parameter.get_encoded(),
         );
-        let url = self.parameters.collect_endpoint()?;
+        let url = self.parameters.collections_resource_uri()?;
 
         let response_res = retry_http_request(
             self.parameters.http_request_retry_parameters.clone(),
             || async {
                 let mut request = self
                     .http_client
-                    .post(url.clone())
+                    .put(url.clone())
                     .header(CONTENT_TYPE, CollectReq::<TimeInterval>::MEDIA_TYPE)
                     .body(collect_request.get_encoded());
                 match &self.parameters.authentication {
@@ -392,7 +393,7 @@ where
         let response_res = retry_http_request(
             self.parameters.http_request_retry_parameters.clone(),
             || async {
-                let mut request = self.http_client.get(job.collect_job_url.clone());
+                let mut request = self.http_client.post(job.collect_job_url.clone());
                 match &self.parameters.authentication {
                     Authentication::DapAuthToken(token) => {
                         request = request.header(DAP_AUTH_HEADER, token.as_bytes())
@@ -722,8 +723,10 @@ mod tests {
         let collect_resp =
             build_collect_response(&transcript, &collector.parameters, batch_interval);
 
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
+
         let collect_job_url = format!("{}/collect_job/1", mockito::server_url());
-        let mocked_collect_start_error = mock("POST", "/collect")
+        let mocked_collect_start_error = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -731,7 +734,7 @@ mod tests {
             .with_status(500)
             .expect(3)
             .create();
-        let mocked_collect_start_success = mock("POST", "/collect")
+        let mocked_collect_start_success = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -740,15 +743,15 @@ mod tests {
             .with_header(LOCATION.as_str(), &collect_job_url)
             .expect(1)
             .create();
-        let mocked_collect_error = mock("GET", "/collect_job/1")
+        let mocked_collect_error = mock("POST", "/collect_job/1")
             .with_status(500)
             .expect(3)
             .create();
-        let mocked_collect_accepted = mock("GET", "/collect_job/1")
+        let mocked_collect_accepted = mock("POST", "/collect_job/1")
             .with_status(202)
             .expect(2)
             .create();
-        let mocked_collect_complete = mock("GET", "/collect_job/1")
+        let mocked_collect_complete = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -794,8 +797,9 @@ mod tests {
         let collect_resp =
             build_collect_response(&transcript, &collector.parameters, batch_interval);
 
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
         let collect_job_url = format!("{}/collect_job/1", mockito::server_url());
-        let mocked_collect_start_success = mock("POST", "/collect")
+        let mocked_collect_start_success = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -804,7 +808,7 @@ mod tests {
             .with_header(LOCATION.as_str(), &collect_job_url)
             .expect(1)
             .create();
-        let mocked_collect_complete = mock("GET", "/collect_job/1")
+        let mocked_collect_complete = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -844,8 +848,10 @@ mod tests {
         let collect_resp =
             build_collect_response(&transcript, &collector.parameters, batch_interval);
 
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
+
         let collect_job_url = format!("{}/collect_job/1", mockito::server_url());
-        let mocked_collect_start_success = mock("POST", "/collect")
+        let mocked_collect_start_success = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -854,7 +860,7 @@ mod tests {
             .with_header(LOCATION.as_str(), &collect_job_url)
             .expect(1)
             .create();
-        let mocked_collect_complete = mock("GET", "/collect_job/1")
+        let mocked_collect_complete = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -885,7 +891,9 @@ mod tests {
         let vdaf = Prio3::new_aes128_count(2).unwrap();
         let collector = setup_collector(vdaf);
 
-        let mock_server_error = mock("POST", "/collect")
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
+
+        let mock_server_error = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -909,7 +917,7 @@ mod tests {
 
         mock_server_error.assert();
 
-        let mock_server_error_details = mock("POST", "/collect")
+        let mock_server_error_details = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -931,7 +939,7 @@ mod tests {
 
         mock_server_error_details.assert();
 
-        let mock_server_no_location = mock("POST", "/collect")
+        let mock_server_no_location = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -948,7 +956,7 @@ mod tests {
 
         mock_server_no_location.assert();
 
-        let mock_bad_request = mock("POST", "/collect")
+        let mock_bad_request = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -984,8 +992,9 @@ mod tests {
         let vdaf = Prio3::new_aes128_count(2).unwrap();
         let collector = setup_collector(vdaf);
 
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
         let collect_job_url = format!("{}/collect_job/1", mockito::server_url());
-        let mock_collect_start = mock("POST", "/collect")
+        let mock_collect_start = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -994,7 +1003,7 @@ mod tests {
             .with_header(LOCATION.as_str(), &collect_job_url)
             .expect(1)
             .create();
-        let mock_collect_job_server_error = mock("GET", "/collect_job/1")
+        let mock_collect_job_server_error = mock("POST", "/collect_job/1")
             .with_status(500)
             .expect_at_least(1)
             .create();
@@ -1016,7 +1025,7 @@ mod tests {
         mock_collect_start.assert();
         mock_collect_job_server_error.assert();
 
-        let mock_collect_job_server_error_details = mock("GET", "/collect_job/1")
+        let mock_collect_job_server_error_details = mock("POST", "/collect_job/1")
             .with_status(500)
             .with_header("Content-Type", "application/problem+json")
             .with_body("{\"type\": \"http://example.com/test_server_error\"}")
@@ -1031,7 +1040,7 @@ mod tests {
 
         mock_collect_job_server_error_details.assert();
 
-        let mock_collect_job_bad_request = mock("GET", "/collect_job/1")
+        let mock_collect_job_bad_request = mock("POST", "/collect_job/1")
             .with_status(400)
             .with_header("Content-Type", "application/problem+json")
             .with_body(concat!(
@@ -1050,7 +1059,7 @@ mod tests {
 
         mock_collect_job_bad_request.assert();
 
-        let mock_collect_job_bad_message_bytes = mock("GET", "/collect_job/1")
+        let mock_collect_job_bad_message_bytes = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -1065,7 +1074,7 @@ mod tests {
 
         mock_collect_job_bad_message_bytes.assert();
 
-        let mock_collect_job_bad_share_count = mock("GET", "/collect_job/1")
+        let mock_collect_job_bad_share_count = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -1083,7 +1092,7 @@ mod tests {
 
         mock_collect_job_bad_share_count.assert();
 
-        let mock_collect_job_bad_ciphertext = mock("GET", "/collect_job/1")
+        let mock_collect_job_bad_ciphertext = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -1148,7 +1157,7 @@ mod tests {
                 .unwrap(),
             ]),
         );
-        let mock_collect_job_bad_shares = mock("GET", "/collect_job/1")
+        let mock_collect_job_bad_shares = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -1194,7 +1203,7 @@ mod tests {
                 .unwrap(),
             ]),
         );
-        let mock_collect_job_unshard_failure = mock("GET", "/collect_job/1")
+        let mock_collect_job_unshard_failure = mock("POST", "/collect_job/1")
             .with_status(200)
             .with_header(
                 CONTENT_TYPE.as_str(),
@@ -1209,7 +1218,7 @@ mod tests {
 
         mock_collect_job_unshard_failure.assert();
 
-        let mock_collect_job_always_fail = mock("GET", "/collect_job/1")
+        let mock_collect_job_always_fail = mock("POST", "/collect_job/1")
             .with_status(500)
             .expect_at_least(3)
             .create();
@@ -1227,8 +1236,9 @@ mod tests {
         let vdaf = Prio3::new_aes128_count(2).unwrap();
         let collector = setup_collector(vdaf);
 
+        let collections_path = format!("/tasks/{}/collections", collector.parameters.task_id);
         let collect_job_url = format!("{}/collect_job/1", mockito::server_url());
-        let mock_collect_start = mock("POST", "/collect")
+        let mock_collect_start = mock("PUT", collections_path.as_str())
             .match_header(
                 CONTENT_TYPE.as_str(),
                 CollectReq::<TimeInterval>::MEDIA_TYPE,
@@ -1248,7 +1258,7 @@ mod tests {
             .unwrap();
         mock_collect_start.assert();
 
-        let mock_collect_poll_no_retry_after = mock("GET", "/collect_job/1")
+        let mock_collect_poll_no_retry_after = mock("POST", "/collect_job/1")
             .with_status(202)
             .expect(1)
             .create();
@@ -1258,7 +1268,7 @@ mod tests {
         );
         mock_collect_poll_no_retry_after.assert();
 
-        let mock_collect_poll_retry_after_60s = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_60s = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "60")
             .expect(1)
@@ -1269,7 +1279,7 @@ mod tests {
         );
         mock_collect_poll_retry_after_60s.assert();
 
-        let mock_collect_poll_retry_after_date_time = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_date_time = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT")
             .expect(1)
@@ -1304,12 +1314,12 @@ mod tests {
         .unwrap();
         let job = CollectJob::new(collect_job_url.parse().unwrap(), batch_interval, ());
 
-        let mock_collect_poll_retry_after_1s = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_1s = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "1")
             .expect(1)
             .create();
-        let mock_collect_poll_retry_after_10s = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_10s = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "10")
             .expect(1)
@@ -1324,17 +1334,17 @@ mod tests {
         let near_future =
             Utc::now() + chrono::Duration::from_std(std::time::Duration::from_secs(1)).unwrap();
         let near_future_formatted = near_future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-        let mock_collect_poll_retry_after_near_future = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_near_future = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", &near_future_formatted)
             .expect(1)
             .create();
-        let mock_collect_poll_retry_after_past = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_past = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "Mon, 01 Jan 1900 00:00:00 GMT")
             .expect(1)
             .create();
-        let mock_collect_poll_retry_after_far_future = mock("GET", "/collect_job/1")
+        let mock_collect_poll_retry_after_far_future = mock("POST", "/collect_job/1")
             .with_status(202)
             .with_header("Retry-After", "Wed, 01 Jan 3000 00:00:00 GMT")
             .expect(1)
@@ -1356,7 +1366,7 @@ mod tests {
             .parameters
             .collect_poll_wait_parameters
             .initial_interval = std::time::Duration::from_millis(10);
-        let mock_collect_poll_no_retry_after = mock("GET", "/collect_job/1")
+        let mock_collect_poll_no_retry_after = mock("POST", "/collect_job/1")
             .with_status(202)
             .expect_at_least(1)
             .create();
