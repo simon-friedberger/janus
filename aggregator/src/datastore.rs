@@ -1594,27 +1594,6 @@ impl<C: Clock> Transaction<'_, C> {
         )
     }
 
-    /// Returns the task ID for the provided collect job ID, or `None` if no such collect job
-    /// exists.
-    #[tracing::instrument(skip(self), err)]
-    pub async fn get_collect_job_task_id(
-        &self,
-        collect_job_id: &Uuid,
-    ) -> Result<Option<TaskId>, Error> {
-        let stmt = self
-            .tx
-            .prepare_cached(
-                "SELECT task_id FROM tasks
-                WHERE id = (SELECT task_id FROM collect_jobs WHERE collect_job_id = $1)",
-            )
-            .await?;
-        self.tx
-            .query_opt(&stmt, &[&collect_job_id])
-            .await?
-            .map(|row| TaskId::get_decoded(row.get("task_id")).map_err(Error::from))
-            .transpose()
-    }
-
     /// Returns the collect job for the provided UUID, or `None` if no such collect job exists.
     #[tracing::instrument(skip(self), err)]
     pub async fn get_collect_job<const L: usize, A: vdaf::Aggregator<L>>(
@@ -6081,84 +6060,6 @@ mod tests {
 
         assert_eq!(collect_jobs_by_time, want_collect_jobs);
         assert_eq!(collect_jobs_by_interval, want_collect_jobs);
-    }
-
-    #[tokio::test]
-    async fn get_collect_job_task_id() {
-        install_test_trace_subscriber();
-
-        let first_task = TaskBuilder::new(
-            QueryType::TimeInterval,
-            VdafInstance::Prio3Aes128Count,
-            Role::Leader,
-        )
-        .build();
-        let second_task = TaskBuilder::new(
-            QueryType::TimeInterval,
-            VdafInstance::Prio3Aes128Count,
-            Role::Leader,
-        )
-        .build();
-        let batch_interval = Interval::new(
-            Time::from_seconds_since_epoch(100),
-            Duration::from_seconds(100),
-        )
-        .unwrap();
-
-        let (ds, _db_handle) = ephemeral_datastore(MockClock::default()).await;
-
-        ds.run_tx(|tx| {
-            let (first_task, second_task) = (first_task.clone(), second_task.clone());
-            Box::pin(async move {
-                tx.put_task(&first_task).await.unwrap();
-                tx.put_task(&second_task).await.unwrap();
-
-                let first_collect_job_id = Uuid::new_v4();
-                tx.put_collect_job(&CollectJob::new(
-                    *first_task.id(),
-                    first_collect_job_id,
-                    batch_interval,
-                    (),
-                    CollectJobState::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::Start,
-                ))
-                .await
-                .unwrap();
-
-                let second_collect_job_id = Uuid::new_v4();
-                tx.put_collect_job(&CollectJob::new(
-                    *second_task.id(),
-                    second_collect_job_id,
-                    batch_interval,
-                    (),
-                    CollectJobState::<PRIO3_AES128_VERIFY_KEY_LENGTH, Prio3Aes128Count>::Start,
-                ))
-                .await
-                .unwrap();
-
-                assert_eq!(
-                    Some(first_task.id()),
-                    tx.get_collect_job_task_id(&first_collect_job_id)
-                        .await
-                        .unwrap()
-                        .as_ref()
-                );
-                assert_eq!(
-                    Some(second_task.id()),
-                    tx.get_collect_job_task_id(&second_collect_job_id)
-                        .await
-                        .unwrap()
-                        .as_ref()
-                );
-                assert_eq!(
-                    None,
-                    tx.get_collect_job_task_id(&Uuid::new_v4()).await.unwrap()
-                );
-
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
     }
 
     #[tokio::test]

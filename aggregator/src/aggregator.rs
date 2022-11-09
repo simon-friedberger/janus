@@ -433,15 +433,13 @@ impl<C: Clock> Aggregator<C> {
     /// corresponding to the `CollectReq`.
     async fn handle_collect(
         &self,
+        task_id: &TaskId,
         req_bytes: &[u8],
         auth_token: Option<String>,
     ) -> Result<Url, Error> {
-        // Parse task ID early to avoid parsing the entire message before performing authentication.
-        // This assumes that the task ID is at the start of the message content.
-        let task_id = TaskId::decode(&mut Cursor::new(req_bytes))?;
-        let task_aggregator = self.task_aggregator_for(&task_id).await?;
+        let task_aggregator = self.task_aggregator_for(task_id).await?;
         if task_aggregator.task.role() != &Role::Leader {
-            return Err(Error::UnrecognizedTask(task_id));
+            return Err(Error::UnrecognizedTask(*task_id));
         }
         if !auth_token
             .map(|t| {
@@ -451,11 +449,10 @@ impl<C: Clock> Aggregator<C> {
             })
             .unwrap_or(false)
         {
-            return Err(Error::UnauthorizedRequest(task_id));
+            return Err(Error::UnauthorizedRequest(*task_id));
         }
 
         let collect_req = CollectReq::get_decoded(req_bytes)?;
-        assert_eq!(collect_req.task_id(), &task_id);
 
         task_aggregator
             .handle_collect(&self.datastore, collect_req)
@@ -468,15 +465,10 @@ impl<C: Clock> Aggregator<C> {
     /// otherwise.
     async fn handle_get_collect_job(
         &self,
+        task_id: TaskId,
         collect_job_id: Uuid,
         auth_token: Option<String>,
     ) -> Result<Option<Vec<u8>>, Error> {
-        let task_id = self
-            .datastore
-            .run_tx(|tx| Box::pin(async move { tx.get_collect_job_task_id(&collect_job_id).await }))
-            .await?
-            .ok_or(Error::UnrecognizedCollectJob(collect_job_id))?;
-
         let task_aggregator = self.task_aggregator_for(&task_id).await?;
         if task_aggregator.task.role() != &Role::Leader {
             return Err(Error::UnrecognizedTask(task_id));
@@ -501,15 +493,10 @@ impl<C: Clock> Aggregator<C> {
     /// Handle a DELETE request for a collect job.
     async fn handle_delete_collect_job(
         &self,
+        task_id: TaskId,
         collect_job_id: Uuid,
         auth_token: Option<String>,
     ) -> Result<Response, Error> {
-        let task_id = self
-            .datastore
-            .run_tx(|tx| Box::pin(async move { tx.get_collect_job_task_id(&collect_job_id).await }))
-            .await?
-            .ok_or(Error::UnrecognizedCollectJob(collect_job_id))?;
-
         let task_aggregator = self.task_aggregator_for(&task_id).await?;
         if task_aggregator.task.role() != &Role::Leader {
             return Err(Error::UnrecognizedTask(task_id));
@@ -747,11 +734,10 @@ impl TaskAggregator {
             .handle_collect(datastore, Arc::clone(&self.task), Arc::new(req))
             .await?;
 
-        Ok(self
-            .task
-            .aggregator_url(&Role::Leader)?
-            .join("collect_jobs/")?
-            .join(&collect_job_id.to_string())?)
+        Ok(self.task.aggregator_url(&Role::Leader)?.join(&format!(
+            "tasks/{}/collections/{collect_job_id}",
+            self.task.id()
+        ))?)
     }
 
     async fn handle_get_collect_job<C: Clock>(
@@ -1926,7 +1912,7 @@ impl VdafOps {
 
                     let collect_job_id = Uuid::new_v4();
                     tx.put_collect_job(&CollectJob::new(
-                        *req.task_id(),
+                        *task.id(),
                         collect_job_id,
                         *req.query().batch_interval(),
                         aggregation_param,
@@ -2820,44 +2806,49 @@ pub fn aggregator_filter<C: Clock>(
         "aggregate",
     );
 
-    let collect_routing = warp::path("collect");
-    let collect_responding = warp::post()
-        .and(warp::header::exact(
-            CONTENT_TYPE.as_str(),
-            CollectReq::<TimeInterval>::MEDIA_TYPE,
-        ))
-        .and(with_cloned_value(Arc::clone(&aggregator)))
-        .and(warp::body::bytes())
-        .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
-        .then(
-            |aggregator: Arc<Aggregator<C>>, body: Bytes, auth_token: Option<String>| async move {
-                let collect_uri = aggregator.handle_collect(&body, auth_token).await?;
-                // §4.5: Response is an HTTP 303 with the collect URI in a Location header.
-                Ok(reply::with_status(
-                    reply::with_header(reply::reply(), LOCATION, collect_uri.as_str()),
-                    StatusCode::SEE_OTHER,
-                ))
-            },
-        );
-    let collect_endpoint = compose_common_wrappers(
-        collect_routing,
-        collect_responding,
+    let collections_endpoint = compose_common_wrappers_hack(
+        warp::put()
+            .and(warp::path!("tasks" / TaskId / "collections"))
+            .and(warp::header::exact(
+                CONTENT_TYPE.as_str(),
+                CollectReq::<TimeInterval>::MEDIA_TYPE,
+            ))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
+            .and(warp::body::bytes())
+            .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
+            .then(
+                |task_id: TaskId,
+                 aggregator: Arc<Aggregator<C>>,
+                 body: Bytes,
+                 auth_token: Option<String>| async move {
+                    let collect_uri = aggregator
+                        .handle_collect(&task_id, &body, auth_token)
+                        .await?;
+                    // §4.5: Response is an HTTP 303 with the collect URI in a Location header.
+                    Ok(reply::with_status(
+                        reply::with_header(reply::reply(), LOCATION, collect_uri.as_str()),
+                        StatusCode::SEE_OTHER,
+                    ))
+                },
+            ),
         warp::cors().build(),
         response_time_histogram.clone(),
         "collect",
     );
 
-    let collect_jobs_get_routing = warp::path("collect_jobs").and(warp::get());
-    let collect_jobs_get =
-        with_cloned_value(Arc::clone(&aggregator))
-            .and(warp::path::param())
+    let collection_post_endpoint = compose_common_wrappers_hack(
+        warp::post()
+            .and(warp::path!("tasks" / TaskId / "collections" / Uuid))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
             .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
             .then(
-                |aggregator: Arc<Aggregator<C>>,
+                |task_id: TaskId,
                  collect_job_id: Uuid,
+                 aggregator: Arc<Aggregator<C>>,
+
                  auth_token: Option<String>| async move {
                     let resp_bytes = aggregator
-                        .handle_get_collect_job(collect_job_id, auth_token)
+                        .handle_get_collect_job(task_id, collect_job_id, auth_token)
                         .await?;
                     match resp_bytes {
                         Some(resp_bytes) => http::Response::builder()
@@ -2869,35 +2860,30 @@ pub fn aggregator_filter<C: Clock>(
                     }
                     .map_err(|err| Error::Internal(format!("couldn't produce response: {}", err)))
                 },
-            );
-    let collect_jobs_get_endpoint = compose_common_wrappers(
-        collect_jobs_get_routing,
-        collect_jobs_get,
+            ),
         warp::cors().build(),
         response_time_histogram.clone(),
-        "collect_jobs_get",
+        "collections_post",
     );
 
-    let collect_jobs_delete_routing = warp::path("collect_jobs").and(warp::delete());
-    let collect_jobs_delete =
-        with_cloned_value(Arc::clone(&aggregator))
-            .and(warp::path::param())
+    let collection_delete_endpoint = compose_common_wrappers_hack(
+        warp::delete()
+            .and(warp::path!("tasks" / TaskId / "collections" / Uuid))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
             .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
             .then(
-                |aggregator: Arc<Aggregator<C>>,
+                |task_id: TaskId,
                  collect_job_id: Uuid,
+                 aggregator: Arc<Aggregator<C>>,
                  auth_token: Option<String>| async move {
                     aggregator
-                        .handle_delete_collect_job(collect_job_id, auth_token)
+                        .handle_delete_collect_job(task_id, collect_job_id, auth_token)
                         .await
                 },
-            );
-    let collect_jobs_delete_endpoint = compose_common_wrappers(
-        collect_jobs_delete_routing,
-        collect_jobs_delete,
+            ),
         warp::cors().build(),
         response_time_histogram.clone(),
-        "collect_jobs_delete",
+        "collections_delete",
     );
 
     let aggregate_share_routing = warp::path("aggregate_share");
@@ -2930,9 +2916,9 @@ pub fn aggregator_filter<C: Clock>(
     Ok(hpke_config_endpoint
         .or(upload_endpoint)
         .or(aggregate_endpoint)
-        .or(collect_endpoint)
-        .or(collect_jobs_get_endpoint)
-        .or(collect_jobs_delete_endpoint)
+        .or(collections_endpoint)
+        .or(collection_post_endpoint)
+        .or(collection_delete_endpoint)
         .or(aggregate_share_endpoint)
         .boxed())
 }
@@ -6199,7 +6185,6 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(Time::from_seconds_since_epoch(0), *task.time_precision()).unwrap(),
             ),
@@ -6207,8 +6192,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header("DAP-Auth-Token", generate_auth_token().as_bytes())
             .header(CONTENT_TYPE, CollectReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
@@ -6249,7 +6234,6 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(
                     Time::from_seconds_since_epoch(0),
@@ -6262,8 +6246,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6307,7 +6291,6 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(
                     Time::from_seconds_since_epoch(0),
@@ -6321,8 +6304,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6368,7 +6351,6 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(
                     Time::from_seconds_since_epoch(0),
@@ -6380,8 +6362,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6433,16 +6415,12 @@ mod tests {
 
         let filter = aggregator_filter(Arc::clone(&datastore), clock).unwrap();
 
-        let req = CollectReq::new(
-            *task.id(),
-            Query::new_time_interval(batch_interval),
-            Vec::new(),
-        );
+        let req = CollectReq::new(Query::new_time_interval(batch_interval), Vec::new());
 
         // Incorrect authentication token.
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header("DAP-Auth-Token", generate_auth_token().as_bytes())
             .header(CONTENT_TYPE, CollectReq::<TimeInterval>::MEDIA_TYPE)
             .body(req.get_encoded())
@@ -6469,8 +6447,8 @@ mod tests {
 
         // Aggregator authentication token.
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
@@ -6500,8 +6478,8 @@ mod tests {
 
         // Missing authentication token.
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(CONTENT_TYPE, CollectReq::<TimeInterval>::MEDIA_TYPE)
             .body(req.get_encoded())
             .filter(&filter)
@@ -6548,15 +6526,11 @@ mod tests {
 
         let filter = aggregator_filter(Arc::clone(&datastore), clock).unwrap();
 
-        let request = CollectReq::new(
-            *task.id(),
-            Query::new_time_interval(batch_interval),
-            Vec::new(),
-        );
+        let request = CollectReq::new(Query::new_time_interval(batch_interval), Vec::new());
 
         let response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6571,17 +6545,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         let collect_uri =
             Url::parse(response.headers().get(LOCATION).unwrap().to_str().unwrap()).unwrap();
-        assert_eq!(collect_uri.scheme(), "https");
-        assert_eq!(collect_uri.host_str().unwrap(), "leader.endpoint");
-        let mut path_segments = collect_uri.path_segments().unwrap();
-        assert_eq!(path_segments.next(), Some("collect_jobs"));
-        let collect_job_id = Uuid::parse_str(path_segments.next().unwrap()).unwrap();
-        assert!(path_segments.next().is_none());
 
         // Incorrect authentication token.
         let mut response = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{}", collect_job_id))
+            .method("POST")
+            .path(collect_uri.path())
             .header("DAP-Auth-Token", generate_auth_token().as_bytes())
             .filter(&filter)
             .await
@@ -6606,8 +6574,8 @@ mod tests {
 
         // Aggregator authentication token.
         let mut response = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{}", collect_job_id))
+            .method("POST")
+            .path(collect_uri.path())
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
@@ -6635,8 +6603,8 @@ mod tests {
 
         // Missing authentication token.
         let mut response = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{}", collect_job_id))
+            .method("POST")
+            .path(collect_uri.path())
             .filter(&filter)
             .await
             .unwrap()
@@ -6687,15 +6655,11 @@ mod tests {
 
         let filter = aggregator_filter(Arc::clone(&datastore), clock).unwrap();
 
-        let request = CollectReq::new(
-            *task.id(),
-            Query::new_time_interval(batch_interval),
-            Vec::new(),
-        );
+        let request = CollectReq::new(Query::new_time_interval(batch_interval), Vec::new());
 
         let response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6713,13 +6677,18 @@ mod tests {
         assert_eq!(collect_uri.scheme(), "https");
         assert_eq!(collect_uri.host_str().unwrap(), "leader.endpoint");
         let mut path_segments = collect_uri.path_segments().unwrap();
-        assert_eq!(path_segments.next(), Some("collect_jobs"));
+        assert_eq!(path_segments.next(), Some("tasks"));
+        assert_eq!(
+            path_segments.next(),
+            Some(format!("{}", task.id()).as_str())
+        );
+        assert_eq!(path_segments.next(), Some("collections"));
         let collect_job_id = Uuid::parse_str(path_segments.next().unwrap()).unwrap();
         assert!(path_segments.next().is_none());
 
         let collect_job_response = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{}", collect_job_id))
+            .method("POST")
+            .path(collect_uri.path())
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6777,8 +6746,8 @@ mod tests {
             .unwrap();
 
         let (parts, body) = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{}", collect_job_id))
+            .method("POST")
+            .path(collect_uri.path())
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6831,11 +6800,14 @@ mod tests {
         let (datastore, _db_handle) = ephemeral_datastore(MockClock::default()).await;
         let filter = aggregator_filter(Arc::new(datastore), MockClock::default()).unwrap();
 
+        let no_such_task_id: TaskId = random();
         let no_such_collect_job_id = Uuid::new_v4();
 
         let response = warp::test::request()
-            .method("GET")
-            .path(&format!("/collect_jobs/{no_such_collect_job_id}"))
+            .method("POST")
+            .path(&format!(
+                "/tasks/{no_such_task_id}/collections/{no_such_collect_job_id}"
+            ))
             .header(
                 "DAP-Auth-Token",
                 "this is a fake authentication token since there are no tasks",
@@ -6885,7 +6857,6 @@ mod tests {
 
         // Sending this request will consume a query for [0, time_precision).
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(Time::from_seconds_since_epoch(0), *task.time_precision()).unwrap(),
             ),
@@ -6893,8 +6864,8 @@ mod tests {
         );
 
         let response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6910,7 +6881,6 @@ mod tests {
 
         // This request will not be allowed due to the query count already being consumed.
         let invalid_request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(Time::from_seconds_since_epoch(0), *task.time_precision()).unwrap(),
             ),
@@ -6918,8 +6888,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -6985,7 +6955,6 @@ mod tests {
 
         // Sending this request will consume a query for [0, 2 * time_precision).
         let request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(
                     Time::from_seconds_since_epoch(0),
@@ -6999,8 +6968,8 @@ mod tests {
         );
 
         let response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -7016,7 +6985,6 @@ mod tests {
 
         // This request will not be allowed due to overlapping with the previous request.
         let invalid_request = CollectReq::new(
-            *task.id(),
             Query::new_time_interval(
                 Interval::new(
                     Time::from_seconds_since_epoch(0)
@@ -7030,8 +6998,8 @@ mod tests {
         );
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -7084,7 +7052,11 @@ mod tests {
         // Try to delete a collect job that doesn't exist
         let delete_job_response = warp::test::request()
             .method("DELETE")
-            .path(&format!("/collect_jobs/{}", Uuid::new_v4()))
+            .path(&format!(
+                "/tasks/{}/collections/{}",
+                task.id(),
+                Uuid::new_v4()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -7096,15 +7068,11 @@ mod tests {
         assert_eq!(delete_job_response.status(), StatusCode::NOT_FOUND);
 
         // Create a collect job
-        let request = CollectReq::new(
-            *task.id(),
-            Query::new_time_interval(batch_interval),
-            Vec::new(),
-        );
+        let request = CollectReq::new(Query::new_time_interval(batch_interval), Vec::new());
 
         let collect_response = warp::test::request()
-            .method("POST")
-            .path("/collect")
+            .method("PUT")
+            .path(&format!("/tasks/{}/collections", task.id()))
             .header(
                 "DAP-Auth-Token",
                 task.primary_collector_auth_token().as_bytes(),
@@ -7143,7 +7111,7 @@ mod tests {
 
         // Get the job again
         let get_response = warp::test::request()
-            .method("GET")
+            .method("POST")
             .path(collect_uri.path())
             .header(
                 "DAP-Auth-Token",
