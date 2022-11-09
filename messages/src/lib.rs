@@ -846,6 +846,7 @@ impl Decode for HpkeConfig {
 }
 
 /// DAP protocol message representing client report metadata in the upload sub-protocol.
+// TODO(timg): unit tests for roundtripping encoding of UploadReportMetadata
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UploadReportMetadata {
     time: Time,
