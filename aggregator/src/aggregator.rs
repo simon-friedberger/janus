@@ -1239,7 +1239,7 @@ impl VdafOps {
                 Err(err) => {
                     warn!(
                         report.task_id = %task.id(),
-                        report.id = ?                report_id,
+                        report.id = ?report_id,
 
                         report.metadata = ?report.metadata(),
                         ?err,
@@ -1255,7 +1255,12 @@ impl VdafOps {
             hpke_private_key,
             &HpkeApplicationInfo::new(&Label::InputShare, &Role::Client, task.role()),
             leader_encrypted_input_share,
-            &associated_data_for_report_share(task.id(), report.metadata(), report.public_share()),
+            &associated_data_for_report_share(
+                task.id(),
+                Some(report_id),
+                report.metadata(),
+                report.public_share(),
+            ),
         ) {
             Ok(leader_decrypted_input_share) => leader_decrypted_input_share,
             Err(error) => {
@@ -1430,6 +1435,7 @@ impl VdafOps {
                     report_share.encrypted_input_share(),
                     &associated_data_for_report_share(
                         task.id(),
+                        None,
                         report_share.metadata(),
                         report_share.public_share(),
                     ),
@@ -3300,6 +3306,7 @@ mod tests {
 
         let associated_data = associated_data_for_report_share(
             task.id(),
+            Some(&report_id),
             &report_metadata,
             &public_share.get_encoded(),
         );
@@ -4139,8 +4146,12 @@ mod tests {
         );
         let mut input_share_bytes = input_share.get_encoded();
         input_share_bytes.push(0); // can no longer be decoded.
-        let aad =
-            associated_data_for_report_share(task.id(), &report_metadata_2, &encoded_public_share);
+        let aad = associated_data_for_report_share(
+            task.id(),
+            None,
+            &report_metadata_2,
+            &encoded_public_share,
+        );
         let report_share_2 = generate_helper_report_share_for_plaintext(
             report_metadata_2,
             &hpke_key.0,
@@ -4236,7 +4247,8 @@ mod tests {
                 .unwrap(),
             Vec::new(),
         );
-        let aad = associated_data_for_report_share(task.id(), &report_metadata_6, &public_share_6);
+        let aad =
+            associated_data_for_report_share(task.id(), None, &report_metadata_6, &public_share_6);
         let report_share_6 = generate_helper_report_share_for_plaintext(
             report_metadata_6,
             &hpke_key.0,
@@ -7720,7 +7732,7 @@ mod tests {
     {
         let encoded_public_share = public_share.get_encoded();
         let associated_data =
-            associated_data_for_report_share(task_id, report_metadata, &encoded_public_share);
+            associated_data_for_report_share(task_id, None, report_metadata, &encoded_public_share);
         generate_helper_report_share_for_plaintext(
             report_metadata.clone(),
             cfg,

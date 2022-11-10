@@ -2185,6 +2185,7 @@ mod tests {
                 .get_encoded(),
             &associated_data_for_report_share(
                 task_id,
+                Some(report_id),
                 report_metadata,
                 &public_share.get_encoded(),
             ),

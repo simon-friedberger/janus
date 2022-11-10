@@ -120,9 +120,7 @@ impl ClientParameters {
 
     /// Create a new resource URI for a DAP report in the provided task.
     #[allow(clippy::result_large_err)]
-    fn report_resource_uri(&self, task_id: &TaskId) -> Result<Url, Error> {
-        let report_id: ReportId = random();
-
+    fn report_resource_uri(&self, task_id: &TaskId, report_id: &ReportId) -> Result<Url, Error> {
         Ok(self
             .aggregator_endpoint(&Role::Leader)?
             .join(&format!("tasks/{task_id}/reports/{report_id}"))?)
@@ -213,7 +211,8 @@ where
     /// Shard a measurement, encrypt its shares, and construct a [`janus_core::message::Report`]
     /// to be uploaded.
     #[allow(clippy::result_large_err)]
-    fn prepare_report(&self, measurement: &V::Measurement) -> Result<Report, Error> {
+    fn prepare_report(&self, measurement: &V::Measurement) -> Result<(ReportId, Report), Error> {
+        let report_id: ReportId = random();
         let (public_share, input_shares) = self.vdaf_client.shard(measurement)?;
         assert_eq!(input_shares.len(), 2); // DAP only supports VDAFs using two aggregators.
 
@@ -229,6 +228,7 @@ where
         let public_share = public_share.get_encoded();
         let associated_data = associated_data_for_report_share(
             &self.parameters.task_id,
+            Some(&report_id),
             &report_metadata,
             &public_share,
         );
@@ -249,10 +249,9 @@ where
         })
         .collect::<Result<_, Error>>()?;
 
-        Ok(Report::new(
-            report_metadata,
-            public_share,
-            encrypted_input_shares,
+        Ok((
+            report_id,
+            Report::new(report_metadata, public_share, encrypted_input_shares),
         ))
     }
 
@@ -261,10 +260,10 @@ where
     /// aggregator and then uploaded to the leader.
     #[tracing::instrument(skip(measurement), err)]
     pub async fn upload(&self, measurement: &V::Measurement) -> Result<(), Error> {
-        let report = self.prepare_report(measurement)?;
+        let (report_id, report) = self.prepare_report(measurement)?;
         let upload_endpoint = self
             .parameters
-            .report_resource_uri(&self.parameters.task_id)?;
+            .report_resource_uri(&self.parameters.task_id, &report_id)?;
         let upload_response = retry_http_request(
             self.parameters.http_request_retry_parameters.clone(),
             || async {
@@ -465,19 +464,19 @@ mod tests {
         client.parameters.time_precision = Duration::from_seconds(100);
         client.clock = MockClock::new(Time::from_seconds_since_epoch(101));
         assert_eq!(
-            client.prepare_report(&1).unwrap().metadata().time(),
+            client.prepare_report(&1).unwrap().1.metadata().time(),
             &Time::from_seconds_since_epoch(100),
         );
 
         client.clock = MockClock::new(Time::from_seconds_since_epoch(5200));
         assert_eq!(
-            client.prepare_report(&1).unwrap().metadata().time(),
+            client.prepare_report(&1).unwrap().1.metadata().time(),
             &Time::from_seconds_since_epoch(5200),
         );
 
         client.clock = MockClock::new(Time::from_seconds_since_epoch(9814));
         assert_eq!(
-            client.prepare_report(&1).unwrap().metadata().time(),
+            client.prepare_report(&1).unwrap().1.metadata().time(),
             &Time::from_seconds_since_epoch(9800),
         );
     }

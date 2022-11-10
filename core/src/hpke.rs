@@ -4,7 +4,7 @@ use derivative::Derivative;
 use hpke_dispatch::{HpkeError, Kem, Keypair};
 use janus_messages::{
     query_type::QueryType, HpkeAeadId, HpkeCiphertext, HpkeConfig, HpkeConfigId, HpkeKdfId,
-    HpkeKemId, HpkePublicKey, Role, TaskId,
+    HpkeKemId, HpkePublicKey, ReportId, Role, TaskId,
 };
 use prio::codec::Encode;
 use std::{fmt::Debug, str::FromStr};
@@ -36,14 +36,19 @@ fn hpke_dispatch_config_from_hpke_config(
 
 /// Construct the HPKE associated data for sealing or opening data enciphered for a report or report
 /// share, per §4.3.2 and 4.4.1.3 of draft-ietf-ppm-dap-02
-// TODO(timg): this needs to take report_id: &ReportId and incorporate it into AAD
+// TODO(timg): Do something more graceful than Option<&ReportId>
 pub fn associated_data_for_report_share<M: Encode>(
     task_id: &TaskId,
+    report_id: Option<&ReportId>,
     report_metadata: &M,
     public_share: &[u8],
 ) -> Vec<u8> {
     let mut associated_data = Vec::new();
     task_id.encode(&mut associated_data);
+    if let Some(report_id) = report_id {
+        // report ID must be included in AAD if provided
+        report_id.encode(&mut associated_data);
+    }
     report_metadata.encode(&mut associated_data);
     associated_data.extend(public_share);
     associated_data
