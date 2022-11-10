@@ -2925,6 +2925,7 @@ pub mod models {
     /// AggregationJob represents an aggregation job from the DAP specification.
     #[derive(Clone, Derivative)]
     #[derivative(Debug)]
+    // TODO(timg): deal with round here
     pub struct AggregationJob<const L: usize, Q: QueryType, A: vdaf::Aggregator<L>>
     where
         for<'a> &'a A::AggregateShare: Into<Vec<u8>>,

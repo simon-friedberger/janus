@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use janus_messages::{
-    query_type::TimeInterval, AggregateContinueReq, AggregateContinueResp, AggregateInitializeReq,
-    AggregateInitializeResp, AggregateShareReq, AggregateShareResp, CollectReq, CollectResp,
-    HpkeConfig, Report,
+    query_type::TimeInterval, AggregateJob, AggregateJobPutReq, AggregateShareReq,
+    AggregateShareResp, CollectReq, CollectResp, HpkeConfig, Report,
 };
 use prio::codec::Decode;
 use std::{
@@ -38,18 +37,10 @@ fn decode_dap_message(message_file: &str, media_type: &str) -> Result<Box<dyn De
     let decoded = match media_type {
         "hpke-config" => Box::new(HpkeConfig::decode(&mut binary_message)?) as Box<dyn Debug>,
         "report" => Box::new(Report::decode(&mut binary_message)?) as Box<dyn Debug>,
-        "aggregate-initialize-req" => Box::new(AggregateInitializeReq::<TimeInterval>::decode(
+        "aggregate-job-put" => Box::new(AggregateJobPutReq::<TimeInterval>::decode(
             &mut binary_message,
         )?) as Box<dyn Debug>,
-        "aggregate-initialize-resp" => {
-            Box::new(AggregateInitializeResp::decode(&mut binary_message)?) as Box<dyn Debug>
-        }
-        "aggregate-continue-req" => {
-            Box::new(AggregateContinueReq::decode(&mut binary_message)?) as Box<dyn Debug>
-        }
-        "aggregate-continue-resp" => {
-            Box::new(AggregateContinueResp::decode(&mut binary_message)?) as Box<dyn Debug>
-        }
+        "aggregate-job" => Box::new(AggregateJob::decode(&mut binary_message)?) as Box<dyn Debug>,
         "aggregate-share-req" => Box::new(AggregateShareReq::<TimeInterval>::decode(
             &mut binary_message,
         )?) as Box<dyn Debug>,
@@ -83,10 +74,8 @@ struct Options {
     #[structopt(long, short = "t", required = true, possible_values(&[
             "hpke-config",
             "report",
-            "aggregate-initialize-req",
-            "aggregate-initialize-resp",
-            "aggregate-continue-req",
-            "aggregate-continue-resp",
+            "aggregate-job-put",
+            "aggregate-job",
             "aggregate-share-req",
             "aggregate-share-resp",
             "collect-req",

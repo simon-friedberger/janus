@@ -40,11 +40,10 @@ use janus_core::{
 };
 use janus_messages::{
     query_type::{FixedSize, TimeInterval},
-    AggregateContinueReq, AggregateContinueResp, AggregateInitializeReq, AggregateInitializeResp,
-    AggregateShareReq, AggregateShareResp, AggregationJobId, CollectReq, CollectResp,
-    HpkeCiphertext, HpkeConfig, HpkeConfigId, Interval, PartialBatchSelector, PrepareStep,
-    PrepareStepResult, Report, ReportId, ReportIdChecksum, ReportShare, ReportShareError, Role,
-    TaskId, Time,
+    AggregateJob, AggregateJobPutReq, AggregateShareReq, AggregateShareResp, AggregationJobId,
+    CollectReq, CollectResp, HpkeCiphertext, HpkeConfig, HpkeConfigId, Interval,
+    PartialBatchSelector, PrepareStep, PrepareStepResult, Report, ReportId, ReportIdChecksum,
+    ReportShare, ReportShareError, Role, TaskId, Time,
 };
 use opentelemetry::{
     metrics::{Counter, Histogram, Meter, Unit},
@@ -61,7 +60,7 @@ use prio::{
         PrepareTransition,
     },
 };
-use reqwest::Client;
+use reqwest::{Client, Method};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
@@ -365,15 +364,14 @@ impl<C: Clock> Aggregator<C> {
 
     async fn handle_aggregate_init(
         &self,
+        task_id: &TaskId,
+        aggregation_job_id: &AggregationJobId,
         req_bytes: &[u8],
         auth_token: Option<String>,
     ) -> Result<Vec<u8>, Error> {
-        // Parse task ID early to avoid parsing the entire message before performing authentication.
-        // This assumes that the task ID is at the start of the message content.
-        let task_id = TaskId::decode(&mut Cursor::new(req_bytes))?;
-        let task_aggregator = self.task_aggregator_for(&task_id).await?;
+        let task_aggregator = self.task_aggregator_for(task_id).await?;
         if task_aggregator.task.role() != &Role::Helper {
-            return Err(Error::UnrecognizedTask(task_id));
+            return Err(Error::UnrecognizedTask(*task_id));
         }
         if !auth_token
             .map(|t| {
@@ -383,13 +381,14 @@ impl<C: Clock> Aggregator<C> {
             })
             .unwrap_or(false)
         {
-            return Err(Error::UnauthorizedRequest(task_id));
+            return Err(Error::UnauthorizedRequest(*task_id));
         }
 
         Ok(task_aggregator
             .handle_aggregate_init(
                 &self.datastore,
                 &self.aggregate_step_failure_counter,
+                aggregation_job_id,
                 req_bytes,
             )
             .await?
@@ -398,15 +397,14 @@ impl<C: Clock> Aggregator<C> {
 
     async fn handle_aggregate_continue(
         &self,
+        task_id: &TaskId,
+        aggregation_job_id: &AggregationJobId,
         req_bytes: &[u8],
         auth_token: Option<String>,
     ) -> Result<Vec<u8>, Error> {
-        // Parse task ID early to avoid parsing the entire message before performing authentication.
-        // This assumes that the task ID is at the start of the message content.
-        let task_id = TaskId::decode(&mut Cursor::new(req_bytes))?;
-        let task_aggregator = self.task_aggregator_for(&task_id).await?;
+        let task_aggregator = self.task_aggregator_for(task_id).await?;
         if task_aggregator.task.role() != &Role::Helper {
-            return Err(Error::UnrecognizedTask(task_id));
+            return Err(Error::UnrecognizedTask(*task_id));
         }
         if !auth_token
             .map(|t| {
@@ -416,14 +414,18 @@ impl<C: Clock> Aggregator<C> {
             })
             .unwrap_or(false)
         {
-            return Err(Error::UnauthorizedRequest(task_id));
+            return Err(Error::UnauthorizedRequest(*task_id));
         }
 
-        let req = AggregateContinueReq::get_decoded(req_bytes)?;
-        assert_eq!(req.task_id(), &task_id);
+        let req = AggregateJob::get_decoded(req_bytes)?;
 
         Ok(task_aggregator
-            .handle_aggregate_continue(&self.datastore, &self.aggregate_step_failure_counter, req)
+            .handle_aggregate_continue(
+                &self.datastore,
+                &self.aggregate_step_failure_counter,
+                aggregation_job_id,
+                req,
+            )
             .await?
             .get_encoded())
     }
@@ -696,13 +698,15 @@ impl TaskAggregator {
         &self,
         datastore: &Datastore<C>,
         aggregate_step_failure_counter: &Counter<u64>,
+        aggregation_job_id: &AggregationJobId,
         req_bytes: &[u8],
-    ) -> Result<AggregateInitializeResp, Error> {
+    ) -> Result<AggregateJob, Error> {
         self.vdaf_ops
             .handle_aggregate_init(
                 datastore,
                 aggregate_step_failure_counter,
                 Arc::clone(&self.task),
+                aggregation_job_id,
                 req_bytes,
             )
             .await
@@ -712,13 +716,15 @@ impl TaskAggregator {
         &self,
         datastore: &Datastore<C>,
         aggregate_step_failure_counter: &Counter<u64>,
-        req: AggregateContinueReq,
-    ) -> Result<AggregateContinueResp, Error> {
+        aggregation_job_id: &AggregationJobId,
+        req: AggregateJob,
+    ) -> Result<AggregateJob, Error> {
         self.vdaf_ops
             .handle_aggregate_continue(
                 datastore,
                 aggregate_step_failure_counter,
                 Arc::clone(&self.task),
+                aggregation_job_id,
                 Arc::new(req),
             )
             .await
@@ -902,8 +908,9 @@ impl VdafOps {
         datastore: &Datastore<C>,
         aggregate_step_failure_counter: &Counter<u64>,
         task: Arc<Task>,
+        aggregation_job_id: &AggregationJobId,
         req_bytes: &[u8],
-    ) -> Result<AggregateInitializeResp, Error> {
+    ) -> Result<AggregateJob, Error> {
         // TODO(#468): support both TimeInterval & FixedSize tasks (instead of assuming TimeInterval).
         match (task.query_type(), self) {
             (task::QueryType::TimeInterval, VdafOps::Prio3Aes128Count(vdaf, verify_key)) => {
@@ -918,6 +925,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -935,6 +943,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -952,6 +961,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -969,6 +979,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -982,6 +993,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     &VerifyKey::new([]),
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -999,6 +1011,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -1016,6 +1029,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -1033,6 +1047,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -1053,6 +1068,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     verify_key,
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -1066,6 +1082,7 @@ impl VdafOps {
                     aggregate_step_failure_counter,
                     task,
                     &VerifyKey::new([]),
+                    aggregation_job_id,
                     req_bytes,
                 )
                 .await
@@ -1078,8 +1095,9 @@ impl VdafOps {
         datastore: &Datastore<C>,
         aggregate_step_failure_counter: &Counter<u64>,
         task: Arc<Task>,
-        req: Arc<AggregateContinueReq>,
-    ) -> Result<AggregateContinueResp, Error> {
+        aggregation_job_id: &AggregationJobId,
+        req: Arc<AggregateJob>,
+    ) -> Result<AggregateJob, Error> {
         // TODO(#468): support both TimeInterval & FixedSize tasks (instead of assuming TimeInterval).
         match self {
             VdafOps::Prio3Aes128Count(vdaf, _) => {
@@ -1093,6 +1111,7 @@ impl VdafOps {
                     Arc::clone(vdaf),
                     aggregate_step_failure_counter,
                     task,
+                    aggregation_job_id,
                     req,
                 )
                 .await
@@ -1109,6 +1128,7 @@ impl VdafOps {
                     Arc::clone(vdaf),
                     aggregate_step_failure_counter,
                     task,
+                    aggregation_job_id,
                     req,
                 )
                 .await
@@ -1125,6 +1145,7 @@ impl VdafOps {
                     Arc::clone(vdaf),
                     aggregate_step_failure_counter,
                     task,
+                    aggregation_job_id,
                     req,
                 )
                 .await
@@ -1141,6 +1162,7 @@ impl VdafOps {
                     Arc::clone(vdaf),
                     aggregate_step_failure_counter,
                     task,
+                    aggregation_job_id,
                     req,
                 )
                 .await
@@ -1159,6 +1181,7 @@ impl VdafOps {
                     Arc::clone(vdaf),
                     aggregate_step_failure_counter,
                     task,
+                    aggregation_job_id,
                     req,
                 )
                 .await
@@ -1367,8 +1390,9 @@ impl VdafOps {
         aggregate_step_failure_counter: &Counter<u64>,
         task: Arc<Task>,
         verify_key: &VerifyKey<L>,
+        aggregation_job_id: &AggregationJobId,
         req_bytes: &[u8],
-    ) -> Result<AggregateInitializeResp, Error>
+    ) -> Result<AggregateJob, Error>
     where
         A: 'static + Send + Sync,
         A::AggregationParam: Send + Sync,
@@ -1380,10 +1404,7 @@ impl VdafOps {
         A::OutputShare: Send + Sync,
         for<'a> &'a A::OutputShare: Into<Vec<u8>>,
     {
-        // Decode request, and verify that it is for the current task. We use an assert to check
-        // that the task IDs match as this should be guaranteed by the caller.
-        let req = AggregateInitializeReq::<Q>::get_decoded(req_bytes)?;
-        assert_eq!(req.task_id(), task.id());
+        let req = AggregateJobPutReq::<Q>::get_decoded(req_bytes)?;
 
         // If two ReportShare messages have the same report ID, then the helper MUST abort with
         // error "unrecognizedMessage". (§4.4.4.1)
@@ -1517,10 +1538,9 @@ impl VdafOps {
         }
 
         // Store data to datastore.
-        let req = Arc::new(req);
         let aggregation_job = Arc::new(AggregationJob::<L, Q, A>::new(
             *task.id(),
-            *req.job_id(),
+            *aggregation_job_id,
             req.batch_selector().batch_identifier().clone(),
             agg_param,
             if saw_continue {
@@ -1532,9 +1552,9 @@ impl VdafOps {
         let report_share_data = Arc::new(report_share_data);
         let prep_steps = datastore
             .run_tx(|tx| {
-                let (task, req, aggregation_job, report_share_data) = (
+                let (task, aggregation_job_id, aggregation_job, report_share_data) = (
                     Arc::clone(&task),
-                    Arc::clone(&req),
+                    *aggregation_job_id,
                     Arc::clone(&aggregation_job),
                     Arc::clone(&report_share_data),
                 );
@@ -1582,7 +1602,7 @@ impl VdafOps {
                             .await?;
                         tx.put_report_aggregation(&ReportAggregation::<L, A>::new(
                             *task.id(),
-                            *req.job_id(),
+                            aggregation_job_id,
                             *share_data.report_share.metadata().id(),
                             *share_data.report_share.metadata().time(),
                             ord as i64,
@@ -1614,7 +1634,7 @@ impl VdafOps {
             .await?;
 
         // Construct response and return.
-        Ok(AggregateInitializeResp::new(prep_steps))
+        Ok(AggregateJob::new(0, prep_steps))
     }
 
     async fn handle_aggregate_continue_generic<
@@ -1627,8 +1647,9 @@ impl VdafOps {
         vdaf: Arc<A>,
         aggregate_step_failure_counter: &Counter<u64>,
         task: Arc<Task>,
-        req: Arc<AggregateContinueReq>,
-    ) -> Result<AggregateContinueResp, Error>
+        aggregation_job_id: &AggregationJobId,
+        req: Arc<AggregateJob>,
+    ) -> Result<AggregateJob, Error>
     where
         A: 'static + Send + Sync,
         A::AggregationParam: Send + Sync,
@@ -1645,21 +1666,23 @@ impl VdafOps {
         // TODO(#224): don't do O(n) network round-trips (where n is the number of prepare steps)
         Ok(datastore
             .run_tx(|tx| {
-                let (vdaf, aggregate_step_failure_counter, task, req) =
-                    (Arc::clone(&vdaf), aggregate_step_failure_counter.clone(), Arc::clone(&task), Arc::clone(&req));
+                let (vdaf, aggregate_step_failure_counter, task, aggregation_job_id, req) =
+                    (Arc::clone(&vdaf), aggregate_step_failure_counter.clone(), Arc::clone(&task), *aggregation_job_id, Arc::clone(&req));
 
                 Box::pin(async move {
                     // Read existing state.
                     let (aggregation_job, report_aggregations) = try_join!(
-                        tx.get_aggregation_job::<L, Q, A>(task.id(), req.job_id()),
+                        tx.get_aggregation_job::<L, Q, A>(task.id(),
+                    &aggregation_job_id,),
                         tx.get_report_aggregations_for_aggregation_job(
                             vdaf.as_ref(),
                             &Role::Helper,
                             task.id(),
-                            req.job_id(),
+
+                    &aggregation_job_id,
                         ),
                     )?;
-                    let aggregation_job = aggregation_job.ok_or_else(|| datastore::Error::User(Error::UnrecognizedAggregationJob(*task.id(), *req.job_id()).into()))?;
+                    let aggregation_job = aggregation_job.ok_or_else(|| datastore::Error::User(Error::UnrecognizedAggregationJob(*task.id(), aggregation_job_id).into()))?;
 
                     // Handle each transition in the request.
                     let mut report_aggregations = report_aggregations.into_iter();
@@ -1754,7 +1777,12 @@ impl VdafOps {
                             }
 
                             Err(error) => {
-                                info!(task_id = %task.id(), job_id = %req.job_id(), report_id = %prep_step.report_id(), ?error, "Prepare step failed");
+                                info!(
+                                    task_id = %task.id(),
+                                    job_id = %aggregation_job_id,
+                                    report_id = %prep_step.report_id(),
+                                    ?error, "Prepare step failed",
+                                );
                                 aggregate_step_failure_counter.add(&Context::current(), 1, &[KeyValue::new("type", "prepare_step_failure")]);
                                 response_prep_steps.push(PrepareStep::new(
                                     *prep_step.report_id(),
@@ -1791,7 +1819,8 @@ impl VdafOps {
 
                     accumulator.flush_to_datastore(tx).await?;
 
-                    Ok(AggregateContinueResp::new(response_prep_steps))
+                    // TODO(timg): get round value from datastore aggregation job
+                    Ok(AggregateJob::new(req.round() + 1, response_prep_steps))
                 })
             })
             .await?)
@@ -2775,41 +2804,84 @@ pub fn aggregator_filter<C: Clock>(
         "upload",
     );
 
-    let aggregate_routing = warp::path("aggregate");
-    let aggregate_responding = warp::post()
-        .and(with_cloned_value(Arc::clone(&aggregator)))
-        .and(warp::body::bytes())
-        .and(warp::header(CONTENT_TYPE.as_str()))
-        .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
-        .then(
-            |aggregator: Arc<Aggregator<C>>,
-             body: Bytes,
-             content_type: String,
-             auth_token: Option<String>| async move {
-                match content_type.as_str() {
-                    AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE => http::Response::builder()
-                        .header(CONTENT_TYPE, AggregateInitializeResp::MEDIA_TYPE)
-                        .body(aggregator.handle_aggregate_init(&body, auth_token).await?),
-                    AggregateContinueReq::MEDIA_TYPE => http::Response::builder()
-                        .header(CONTENT_TYPE, AggregateContinueResp::MEDIA_TYPE)
+    let aggregation_jobs_put_endpoint = compose_common_wrappers_hack(
+        warp::put()
+            .and(warp::path!(
+                "tasks" / TaskId / "aggregation_jobs" / AggregationJobId
+            ))
+            .and(warp::header::exact(
+                CONTENT_TYPE.as_str(),
+                AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE,
+            ))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
+            .and(warp::body::bytes())
+            .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
+            .then(
+                |task_id: TaskId,
+                 aggregation_job_id: AggregationJobId,
+                 aggregator: Arc<Aggregator<C>>,
+                 body: Bytes,
+                 auth_token: Option<String>| async move {
+                    http::Response::builder()
+                        .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
                         .body(
                             aggregator
-                                .handle_aggregate_continue(&body, auth_token)
+                                .handle_aggregate_init(
+                                    &task_id,
+                                    &aggregation_job_id,
+                                    &body,
+                                    auth_token,
+                                )
                                 .await?,
-                        ),
-                    _ => http::Response::builder()
-                        .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                        .body(Vec::new()),
-                }
-                .map_err(|err| Error::Internal(format!("couldn't produce response: {}", err)))
-            },
-        );
-    let aggregate_endpoint = compose_common_wrappers(
-        aggregate_routing,
-        aggregate_responding,
+                        )
+                        .map_err(|err| {
+                            Error::Internal(format!("couldn't produce response: {}", err))
+                        })
+                },
+            ),
         warp::cors().build(),
         response_time_histogram.clone(),
-        "aggregate",
+        "aggregation_job_put",
+    );
+
+    let aggregation_jobs_post_endpoint = compose_common_wrappers_hack(
+        warp::post()
+            .and(warp::path!(
+                "tasks" / TaskId / "aggregation_jobs" / AggregationJobId
+            ))
+            .and(warp::header::exact(
+                CONTENT_TYPE.as_str(),
+                AggregateJob::MEDIA_TYPE,
+            ))
+            .and(with_cloned_value(Arc::clone(&aggregator)))
+            .and(warp::body::bytes())
+            .and(warp::header::optional::<String>(DAP_AUTH_HEADER))
+            .then(
+                |task_id: TaskId,
+                 aggregation_job_id: AggregationJobId,
+                 aggregator: Arc<Aggregator<C>>,
+                 body: Bytes,
+                 auth_token: Option<String>| async move {
+                    http::Response::builder()
+                        .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
+                        .body(
+                            aggregator
+                                .handle_aggregate_continue(
+                                    &task_id,
+                                    &aggregation_job_id,
+                                    &body,
+                                    auth_token,
+                                )
+                                .await?,
+                        )
+                        .map_err(|err| {
+                            Error::Internal(format!("couldn't produce response: {}", err))
+                        })
+                },
+            ),
+        warp::cors().build(),
+        response_time_histogram.clone(),
+        "aggregation_job_post",
     );
 
     let collections_endpoint = compose_common_wrappers_hack(
@@ -2921,7 +2993,8 @@ pub fn aggregator_filter<C: Clock>(
 
     Ok(hpke_config_endpoint
         .or(upload_endpoint)
-        .or(aggregate_endpoint)
+        .or(aggregation_jobs_put_endpoint)
+        .or(aggregation_jobs_post_endpoint)
         .or(collections_endpoint)
         .or(collection_post_endpoint)
         .or(collection_delete_endpoint)
@@ -2960,8 +3033,9 @@ pub fn aggregator_server<C: Clock>(
     fields(url = %url),
     err,
 )]
-async fn post_to_helper<T: Encode>(
+async fn send_request_to_helper<T: Encode>(
     http_client: &Client,
+    method: Method,
     url: Url,
     content_type: &str,
     request: T,
@@ -2978,7 +3052,7 @@ async fn post_to_helper<T: Encode>(
 
     let start = Instant::now();
     let response_result = http_client
-        .post(url)
+        .request(method, url)
         .header(CONTENT_TYPE, content_type)
         .header(DAP_AUTH_HEADER, auth_token.as_bytes())
         .body(request_body)
@@ -3054,8 +3128,8 @@ async fn post_to_helper<T: Encode>(
 mod tests {
     use crate::{
         aggregator::{
-            aggregator_filter, error_handler, post_to_helper, Aggregator, CollectableQueryType,
-            DapProblemType, DapProblemTypeParseError, Error,
+            aggregator_filter, error_handler, send_request_to_helper, Aggregator,
+            CollectableQueryType, DapProblemType, DapProblemTypeParseError, Error,
         },
         datastore::{
             models::{
@@ -3090,12 +3164,11 @@ mod tests {
         time::{Clock, MockClock, RealClock, TimeExt as _},
     };
     use janus_messages::{
-        query_type::TimeInterval, AggregateContinueReq, AggregateContinueResp,
-        AggregateInitializeReq, AggregateInitializeResp, AggregateReportMetadata,
-        AggregateShareReq, AggregateShareResp, BatchSelector, CollectReq, CollectResp, Duration,
-        HpkeCiphertext, HpkeConfig, HpkeConfigId, Interval, PartialBatchSelector, PrepareStep,
-        PrepareStepResult, Query, Report, ReportId, ReportIdChecksum, ReportShare,
-        ReportShareError, Role, TaskId, Time, UploadReportMetadata,
+        query_type::TimeInterval, AggregateJob, AggregateJobPutReq, AggregateReportMetadata,
+        AggregateShareReq, AggregateShareResp, AggregationJobId, BatchSelector, CollectReq,
+        CollectResp, Duration, HpkeCiphertext, HpkeConfig, HpkeConfigId, Interval,
+        PartialBatchSelector, PrepareStep, PrepareStepResult, Query, Report, ReportId,
+        ReportIdChecksum, ReportShare, ReportShareError, Role, TaskId, Time, UploadReportMetadata,
     };
     use mockito::mock;
     use opentelemetry::global::meter;
@@ -3910,9 +3983,8 @@ mod tests {
 
         datastore.put_task(&task).await.unwrap();
 
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+        let aggregation_job_id: AggregationJobId = random();
+        let request = AggregateJobPutReq::new(
             Vec::new(),
             PartialBatchSelector::new_time_interval(),
             Vec::new(),
@@ -3921,16 +3993,16 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let (part, body) = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -3994,9 +4066,8 @@ mod tests {
 
         datastore.put_task(&task).await.unwrap();
 
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+        let aggregation_job_id: AggregationJobId = random();
+        let request = AggregateJobPutReq::new(
             Vec::new(),
             PartialBatchSelector::new_time_interval(),
             Vec::new(),
@@ -4005,13 +4076,13 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header("DAP-Auth-Token", generate_auth_token().as_bytes())
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4036,12 +4107,12 @@ mod tests {
         assert_eq!(want_status, parts.status.as_u16());
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4283,9 +4354,9 @@ mod tests {
             .await
             .unwrap();
 
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+        let aggregation_job_id: AggregationJobId = random();
+
+        let request = AggregateJobPutReq::new(
             Vec::new(),
             PartialBatchSelector::new_time_interval(),
             Vec::from([
@@ -4303,16 +4374,16 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4321,10 +4392,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateInitializeResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
         let body_bytes = body::to_bytes(response.body_mut()).await.unwrap();
-        let aggregate_resp = AggregateInitializeResp::get_decoded(&body_bytes).unwrap();
+        let aggregate_resp = AggregateJob::get_decoded(&body_bytes).unwrap();
 
         // Validate response.
         assert_eq!(aggregate_resp.prepare_steps().len(), 7);
@@ -4407,9 +4478,9 @@ mod tests {
             &(),
             &(),
         );
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+
+        let aggregation_job_id: AggregationJobId = random();
+        let request = AggregateJobPutReq::new(
             dummy_vdaf::AggregationParam(0).get_encoded(),
             PartialBatchSelector::new_time_interval(),
             Vec::from([report_share.clone()]),
@@ -4419,16 +4490,16 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4437,10 +4508,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateInitializeResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
         let body_bytes = body::to_bytes(response.body_mut()).await.unwrap();
-        let aggregate_resp = AggregateInitializeResp::get_decoded(&body_bytes).unwrap();
+        let aggregate_resp = AggregateJob::get_decoded(&body_bytes).unwrap();
 
         // Validate response.
         assert_eq!(aggregate_resp.prepare_steps().len(), 1);
@@ -4484,9 +4555,9 @@ mod tests {
             &(),
             &(),
         );
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+
+        let aggregation_job_id: AggregationJobId = random();
+        let request = AggregateJobPutReq::new(
             dummy_vdaf::AggregationParam(0).get_encoded(),
             PartialBatchSelector::new_time_interval(),
             Vec::from([report_share.clone()]),
@@ -4496,16 +4567,16 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let mut response = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4514,10 +4585,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateInitializeResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
         let body_bytes = body::to_bytes(response.body_mut()).await.unwrap();
-        let aggregate_resp = AggregateInitializeResp::get_decoded(&body_bytes).unwrap();
+        let aggregate_resp = AggregateJob::get_decoded(&body_bytes).unwrap();
 
         // Validate response.
         assert_eq!(aggregate_resp.prepare_steps().len(), 1);
@@ -4560,9 +4631,8 @@ mod tests {
             ),
         );
 
-        let request = AggregateInitializeReq::new(
-            *task.id(),
-            random(),
+        let aggregation_job_id: AggregationJobId = random();
+        let request = AggregateJobPutReq::new(
             dummy_vdaf::AggregationParam(0).get_encoded(),
             PartialBatchSelector::new_time_interval(),
             Vec::from([report_share.clone(), report_share]),
@@ -4571,16 +4641,16 @@ mod tests {
         let filter = aggregator_filter(Arc::new(datastore), clock).unwrap();
 
         let (parts, body) = warp::test::request()
-            .method("POST")
-            .path("/aggregate")
+            .method("PUT")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(
-                CONTENT_TYPE,
-                AggregateInitializeReq::<TimeInterval>::MEDIA_TYPE,
-            )
+            .header(CONTENT_TYPE, AggregateJobPutReq::<TimeInterval>::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4808,9 +4878,8 @@ mod tests {
             .await
             .unwrap();
 
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([
                 PrepareStep::new(
                     *report_metadata_0.id(),
@@ -4828,12 +4897,15 @@ mod tests {
 
         let mut response = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -4842,21 +4914,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateContinueResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
         let body_bytes = body::to_bytes(response.body_mut()).await.unwrap();
-        let aggregate_resp = AggregateContinueResp::get_decoded(&body_bytes).unwrap();
+        let aggregate_resp = AggregateJob::get_decoded(&body_bytes).unwrap();
 
         // Validate response.
         assert_eq!(
             aggregate_resp,
-            AggregateContinueResp::new(Vec::from([
-                PrepareStep::new(*report_metadata_0.id(), PrepareStepResult::Finished),
-                PrepareStep::new(
-                    *report_metadata_2.id(),
-                    PrepareStepResult::Failed(ReportShareError::BatchCollected),
-                )
-            ]))
+            AggregateJob::new(
+                2,
+                Vec::from([
+                    PrepareStep::new(*report_metadata_0.id(), PrepareStepResult::Finished),
+                    PrepareStep::new(
+                        *report_metadata_2.id(),
+                        PrepareStepResult::Failed(ReportShareError::BatchCollected),
+                    )
+                ])
+            )
         );
 
         // Validate datastore.
@@ -5116,9 +5191,8 @@ mod tests {
             .await
             .unwrap();
 
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id_0,
+        let request = AggregateJob::new(
+            1,
             Vec::from([
                 PrepareStep::new(
                     *report_metadata_0.id(),
@@ -5141,12 +5215,15 @@ mod tests {
 
         let response = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id_0}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -5155,7 +5232,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateContinueResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
 
         let batch_aggregations = datastore
@@ -5401,9 +5478,8 @@ mod tests {
             .await
             .unwrap();
 
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id_1,
+        let request = AggregateJob::new(
+            1,
             Vec::from([
                 PrepareStep::new(
                     *report_metadata_3.id(),
@@ -5425,12 +5501,15 @@ mod tests {
 
         let response = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id_1}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -5439,7 +5518,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            AggregateContinueResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
 
         let batch_aggregations = datastore
@@ -5599,9 +5678,8 @@ mod tests {
             .unwrap();
 
         // Make request.
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([PrepareStep::new(
                 *report_metadata.id(),
                 PrepareStepResult::Finished,
@@ -5612,12 +5690,15 @@ mod tests {
 
         let (parts, body) = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -5714,9 +5795,8 @@ mod tests {
             .unwrap();
 
         // Make request.
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([PrepareStep::new(
                 *report_metadata.id(),
                 PrepareStepResult::Continued(Vec::new()),
@@ -5727,12 +5807,15 @@ mod tests {
 
         let (parts, body) = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -5744,16 +5827,19 @@ mod tests {
         assert_eq!(parts.status, StatusCode::OK);
         assert_eq!(
             parts.headers.get(CONTENT_TYPE).unwrap(),
-            AggregateContinueResp::MEDIA_TYPE
+            AggregateJob::MEDIA_TYPE
         );
         let body_bytes = body::to_bytes(body).await.unwrap();
-        let aggregate_resp = AggregateContinueResp::get_decoded(&body_bytes).unwrap();
+        let aggregate_resp = AggregateJob::get_decoded(&body_bytes).unwrap();
         assert_eq!(
             aggregate_resp,
-            AggregateContinueResp::new(Vec::from([PrepareStep::new(
-                *report_metadata.id(),
-                PrepareStepResult::Failed(ReportShareError::VdafPrepError),
-            )]),)
+            AggregateJob::new(
+                2,
+                Vec::from([PrepareStep::new(
+                    *report_metadata.id(),
+                    PrepareStepResult::Failed(ReportShareError::VdafPrepError),
+                )]),
+            )
         );
 
         // Check datastore state.
@@ -5872,9 +5958,8 @@ mod tests {
             .unwrap();
 
         // Make request.
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([PrepareStep::new(
                 ReportId::from(
                     [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1], // not the same as above
@@ -5887,12 +5972,15 @@ mod tests {
 
         let (parts, body) = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -6022,9 +6110,8 @@ mod tests {
             .unwrap();
 
         // Make request.
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([
                 // Report IDs are in opposite order to what was stored in the datastore.
                 PrepareStep::new(
@@ -6042,12 +6129,15 @@ mod tests {
 
         let (parts, body) = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -6139,9 +6229,8 @@ mod tests {
             .unwrap();
 
         // Make request.
-        let request = AggregateContinueReq::new(
-            *task.id(),
-            aggregation_job_id,
+        let request = AggregateJob::new(
+            1,
             Vec::from([PrepareStep::new(
                 ReportId::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
                 PrepareStepResult::Continued(Vec::new()),
@@ -6152,12 +6241,15 @@ mod tests {
 
         let (parts, body) = warp::test::request()
             .method("POST")
-            .path("/aggregate")
+            .path(&format!(
+                "/tasks/{}/aggregation_jobs/{aggregation_job_id}",
+                task.id()
+            ))
             .header(
                 "DAP-Auth-Token",
                 task.primary_aggregator_auth_token().as_bytes(),
             )
-            .header(CONTENT_TYPE, AggregateContinueReq::MEDIA_TYPE)
+            .header(CONTENT_TYPE, AggregateJob::MEDIA_TYPE)
             .body(request.get_encoded())
             .filter(&filter)
             .await
@@ -7913,8 +8005,9 @@ mod tests {
                 .with_header("Content-Type", "application/problem+json")
                 .with_body(response.body())
                 .create();
-            let actual_error = post_to_helper(
+            let actual_error = send_request_to_helper(
                 &http_client,
+                Method::POST,
                 server_url.clone(),
                 "text/plain",
                 (),

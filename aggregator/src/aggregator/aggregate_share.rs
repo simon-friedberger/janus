@@ -1,7 +1,7 @@
 //! Implements portions of collect sub-protocol for DAP leader and helper.
 
 use crate::{
-    aggregator::{post_to_helper, Error},
+    aggregator::{send_request_to_helper, Error},
     datastore::{
         self,
         models::AcquiredCollectJob,
@@ -35,6 +35,7 @@ use prio::{
         Aggregatable,
     },
 };
+use reqwest::Method;
 use std::sync::Arc;
 use tokio::try_join;
 use tracing::{debug, error, info, warn};
@@ -264,8 +265,9 @@ impl CollectJobDriver {
             checksum,
         );
 
-        let resp_bytes = post_to_helper(
+        let resp_bytes = send_request_to_helper(
             &self.http_client,
+            Method::POST,
             task.aggregator_url(&Role::Helper)?
                 .join("aggregate_share")?,
             AggregateShareReq::<TimeInterval>::MEDIA_TYPE,
