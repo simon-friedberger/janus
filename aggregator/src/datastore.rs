@@ -292,6 +292,12 @@ pub struct Transaction<'a, C: Clock> {
 }
 
 impl<C: Clock> Transaction<'_, C> {
+    /// Execute a sequence of SQL statements.
+    #[tracing::instrument(skip(self), err)]
+    pub async fn batch_execute(&self, query: &str) -> Result<(), Error> {
+        Ok(self.tx.batch_execute(query).await?)
+    }
+
     /// Writes a task into the datastore.
     #[tracing::instrument(skip(self), err)]
     pub async fn put_task(&self, task: &Task) -> Result<(), Error> {
