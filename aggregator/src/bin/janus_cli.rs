@@ -42,13 +42,9 @@ async fn main() -> Result<()> {
         info!("DRY RUN: no persistent changes will be made")
     }
 
-    let kube_client = kube::Client::try_default()
-        .await
-        .context("couldn't connect to Kubernetes environment")?;
-
     command_line_options
         .cmd
-        .execute(&command_line_options, &config_file, &kube_client)
+        .execute(&command_line_options, &config_file)
         .await
 }
 
@@ -81,7 +77,6 @@ impl Command {
         &self,
         command_line_options: &CommandLineOptions,
         config_file: &ConfigFile,
-        kube_client: &kube::Client,
     ) -> Result<()> {
         // Note: to keep this function reasonably-readable, individual command handlers should
         // generally create the command's dependencies based on options/config, then call another
@@ -89,7 +84,7 @@ impl Command {
         match self {
             Command::WriteSchema => {
                 let datastore =
-                    datastore_from_opts(command_line_options, config_file, kube_client).await?;
+                    datastore_from_opts(command_line_options, config_file, None).await?;
                 write_schema(&datastore).await
             }
 
@@ -98,8 +93,12 @@ impl Command {
                 generate_missing_parameters,
                 echo_tasks,
             } => {
+                let kube_client = kube::Client::try_default()
+                    .await
+                    .context("couldn't connect to Kubernetes environment")?;
                 let datastore =
-                    datastore_from_opts(command_line_options, config_file, kube_client).await?;
+                    datastore_from_opts(command_line_options, config_file, Some(&kube_client))
+                        .await?;
 
                 let written_tasks =
                     provision_tasks(&datastore, tasks_file, *generate_missing_parameters).await?;
@@ -114,13 +113,16 @@ impl Command {
             }
 
             Command::CreateDatastoreKey => {
+                let kube_client = kube::Client::try_default()
+                    .await
+                    .context("couldn't connect to Kubernetes environment")?;
                 let k8s_namespace = command_line_options
                     .secrets_k8s_namespace
                     .as_deref()
                     .context("--secrets-k8s-namespace is required")?;
                 create_datastore_key(
                     command_line_options.dry_run,
-                    kube_client,
+                    &kube_client,
                     k8s_namespace,
                     &command_line_options.datastore_keys_secret_name,
                     &command_line_options.datastore_keys_secret_data_key,
@@ -285,7 +287,7 @@ async fn create_datastore_key(
 async fn datastore_from_opts(
     command_line_options: &CommandLineOptions,
     config_file: &ConfigFile,
-    kube_client: &kube::Client,
+    kube_client: Option<&kube::Client>,
 ) -> Result<Datastore<RealClock>> {
     let pool = database_pool(
         &config_file.common_config.database,
@@ -357,8 +359,10 @@ impl CommandLineOptions {
     /// Fetch the datastore keys from the options. If --secrets-k8s-namespace is set, keys are fetched
     /// from a secret therein. Otherwise, returns the keys provided to --datastore-keys. If neither was
     /// set, returns an error.
-    async fn datastore_keys(&self, kube_client: &kube::Client) -> Result<Vec<String>> {
-        if let Some(ref secrets_namespace) = self.secrets_k8s_namespace {
+    async fn datastore_keys(&self, kube_client: Option<&kube::Client>) -> Result<Vec<String>> {
+        if let (Some(ref secrets_namespace), Some(kube_client)) =
+            (&self.secrets_k8s_namespace, kube_client)
+        {
             fetch_datastore_keys(
                 kube_client,
                 secrets_namespace,
@@ -461,7 +465,7 @@ mod tests {
         };
 
         assert_eq!(
-            options.datastore_keys(&kube_client).await.unwrap(),
+            options.datastore_keys(Some(&kube_client)).await.unwrap(),
             expected_datastore_keys
         );
 
@@ -475,7 +479,14 @@ mod tests {
             secrets_k8s_namespace: Some("default".to_string()),
         };
 
-        assert_eq!(options.datastore_keys(&kube_client).await.unwrap().len(), 1);
+        assert_eq!(
+            options
+                .datastore_keys(Some(&kube_client))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Neither flag provided
         let options = CommandLineOptions {
@@ -487,7 +498,10 @@ mod tests {
             secrets_k8s_namespace: None,
         };
 
-        options.datastore_keys(&kube_client).await.unwrap_err();
+        options
+            .datastore_keys(Some(&kube_client))
+            .await
+            .unwrap_err();
     }
 
     #[tokio::test]
