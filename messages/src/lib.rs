@@ -1623,6 +1623,12 @@ impl AsRef<[u8; Self::LEN]> for CollectionJobId {
     }
 }
 
+impl From<[u8; Self::LEN]> for CollectionJobId {
+    fn from(job_id: [u8; Self::LEN]) -> Self {
+        Self(job_id)
+    }
+}
+
 impl TryFrom<&[u8]> for CollectionJobId {
     type Error = &'static str;
 

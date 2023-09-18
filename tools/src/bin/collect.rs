@@ -10,12 +10,15 @@ use derivative::Derivative;
 use fixed::types::extra::{U15, U31, U63};
 #[cfg(feature = "fpvec_bounded_l2")]
 use fixed::{FixedI16, FixedI32, FixedI64};
-use janus_collector::{default_http_client, AuthenticationToken, Collector, CollectorParameters};
+use janus_collector::{
+    default_http_client, AuthenticationToken, CollectionJob, Collector, CollectorParameters,
+    PollResult,
+};
 use janus_core::hpke::{DivviUpHpkeConfig, HpkeKeypair, HpkePrivateKey};
 use janus_messages::{
     query_type::{FixedSize, QueryType, TimeInterval},
-    BatchId, Duration, FixedSizeQuery, HpkeConfig, Interval, PartialBatchSelector, Query, TaskId,
-    Time,
+    BatchId, CollectionJobId, Duration, FixedSizeQuery, HpkeConfig, Interval, PartialBatchSelector,
+    Query, TaskId, Time,
 };
 #[cfg(feature = "fpvec_bounded_l2")]
 use prio::vdaf::prio3::Prio3FixedPointBoundedL2VecSumMultithreaded;
@@ -239,6 +242,43 @@ impl TypedValueParser for BucketsValueParser {
     }
 }
 
+#[derive(Clone)]
+struct CollectionJobIdValueParser {
+    inner: NonEmptyStringValueParser,
+}
+
+impl CollectionJobIdValueParser {
+    fn new() -> CollectionJobIdValueParser {
+        CollectionJobIdValueParser {
+            inner: NonEmptyStringValueParser::new(),
+        }
+    }
+}
+
+impl TypedValueParser for CollectionJobIdValueParser {
+    type Value = CollectionJobId;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let input = self.inner.parse_ref(cmd, arg, value)?;
+        let job_id_bytes: [u8; CollectionJobId::LEN] = URL_SAFE_NO_PAD
+            .decode(input)
+            .map_err(|err| clap::Error::raw(ErrorKind::ValueValidation, err))?
+            .try_into()
+            .map_err(|_| {
+                clap::Error::raw(
+                    ErrorKind::ValueValidation,
+                    "collection job ID length incorrect",
+                )
+            })?;
+        Ok(CollectionJobId::from(job_id_bytes))
+    }
+}
+
 #[derive(Derivative, Args, PartialEq, Eq)]
 #[derivative(Debug)]
 #[group(required = true)]
@@ -300,10 +340,18 @@ struct QueryOptions {
     #[clap(
         long,
         action = ArgAction::SetTrue,
-        conflicts_with_all = ["batch_interval_start", "batch_interval_duration", "batch_id"],
+        conflicts_with_all = ["batch_interval_start", "batch_interval_duration", "batch_id", "collection_job_id"],
         help_heading = "Collect Request Parameters (Fixed Size)",
     )]
     current_batch: bool,
+
+    #[clap(
+        long,
+        value_parser = CollectionJobIdValueParser::new(),
+        conflicts_with_all = ["current_batch"],
+        help_heading = "ID for polling an existing collection job",
+    )]
+    collection_job_id: Option<CollectionJobId>,
 }
 
 #[derive(Derivative, Parser, PartialEq, Eq)]
@@ -440,31 +488,50 @@ async fn run(options: Options) -> Result<(), Error> {
         &options.query.batch_interval_duration,
         &options.query.batch_id,
         options.query.current_batch,
+        options.query.collection_job_id,
     ) {
-        (Some(batch_interval_start), Some(batch_interval_duration), None, false) => {
+        (Some(batch_interval_start), Some(batch_interval_duration), None, false, collection_job_id) => {
             let batch_interval = Interval::new(
                 Time::from_seconds_since_epoch(*batch_interval_start),
                 Duration::from_seconds(*batch_interval_duration),
             )
             .map_err(|err| Error::Anyhow(err.into()))?;
-            run_with_query(options, Query::new_time_interval(batch_interval)).await
+            let collection_job_url = collection_job_id.map(|collection_job_id| format!(
+                "{}/tasks/{}/collection_jobs/{}",
+                options.leader, options.task_id, collection_job_id
+            ).parse().unwrap());
+            run_with_query(options, Query::new_time_interval(batch_interval), collection_job_url).await
         }
-        (None, None, Some(batch_id), false) => {
+        (None, None, Some(batch_id), false, collection_job_id) => {
             let batch_id = *batch_id;
+            let collection_job_url = collection_job_id.map(|collection_job_id| format!(
+                "{}/tasks/{}/collection_jobs/{}",
+                options.leader, options.task_id, collection_job_id
+            ).parse().unwrap());
             run_with_query(
                 options,
                 Query::new_fixed_size(FixedSizeQuery::ByBatchId { batch_id }),
+                collection_job_url,
             )
             .await
         }
-        (None, None, None, true) => {
-            run_with_query(options, Query::new_fixed_size(FixedSizeQuery::CurrentBatch)).await
+        (None, None, None, true, None) => {
+            run_with_query(
+                options,
+                Query::new_fixed_size(FixedSizeQuery::CurrentBatch),
+                None,
+            )
+            .await
         }
         _ => unreachable!(),
     }
 }
 
-async fn run_with_query<Q: QueryType>(options: Options, query: Query<Q>) -> Result<(), Error>
+async fn run_with_query<Q: QueryType>(
+    options: Options,
+    query: Query<Q>,
+    job_url: Option<Url>,
+) -> Result<(), Error>
 where
     Q: QueryTypeExt,
 {
@@ -490,33 +557,33 @@ where
     match (options.vdaf, options.length, options.bits, options.buckets) {
         (VdafType::Count, None, None, None) => {
             let vdaf = Prio3::new_count(2).map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
         (VdafType::CountVec, Some(length), None, None) => {
             let vdaf = Prio3::new_sum_vec(2, 1, length).map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
         (VdafType::Sum, None, Some(bits), None) => {
             let vdaf = Prio3::new_sum(2, bits).map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
         (VdafType::SumVec, Some(length), Some(bits), None) => {
             let vdaf =
                 Prio3::new_sum_vec(2, bits, length).map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
         (VdafType::Histogram, None, None, Some(ref buckets)) => {
             let vdaf =
                 Prio3::new_histogram(2, &buckets.0).map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
@@ -525,7 +592,7 @@ where
             let vdaf: Prio3FixedPointBoundedL2VecSumMultithreaded<FixedI16<U15>> =
                 Prio3::new_fixedpoint_boundedl2_vec_sum_multithreaded(2, length)
                     .map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
@@ -534,7 +601,7 @@ where
             let vdaf: Prio3FixedPointBoundedL2VecSumMultithreaded<FixedI32<U31>> =
                 Prio3::new_fixedpoint_boundedl2_vec_sum_multithreaded(2, length)
                     .map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
@@ -543,7 +610,7 @@ where
             let vdaf: Prio3FixedPointBoundedL2VecSumMultithreaded<FixedI64<U63>> =
                 Prio3::new_fixedpoint_boundedl2_vec_sum_multithreaded(2, length)
                     .map_err(|err| Error::Anyhow(err.into()))?;
-            run_collection_generic(parameters, vdaf, http_client, query, &())
+            run_collection_generic(parameters, vdaf, http_client, query, &(), job_url)
                 .await
                 .map_err(|err| Error::Anyhow(err.into()))
         }
@@ -569,12 +636,23 @@ async fn run_collection_generic<V: vdaf::Collector, Q: QueryTypeExt>(
     http_client: reqwest::Client,
     query: Query<Q>,
     agg_param: &V::AggregationParam,
+    job_url: Option<Url>,
 ) -> Result<(), janus_collector::Error>
 where
     V::AggregateResult: Debug,
 {
     let collector = Collector::new(parameters, vdaf, http_client);
-    let collection = collector.collect(query, agg_param).await?;
+    let job = if let Some(job_url) = job_url {
+        CollectionJob::new(job_url, query, agg_param.clone())
+    } else {
+        let new_job = collector.start_collection(query, agg_param).await?;
+        println!("Created collection job: {:?}", new_job);
+        new_job
+    };
+    let collection = match collector.poll_once(&job).await? {
+        PollResult::CollectionResult(aggregate_result) => aggregate_result,
+        PollResult::NextAttempt(_) => return Ok(()),
+    };
     if !Q::IS_PARTIAL_BATCH_SELECTOR_TRIVIAL {
         println!(
             "Batch: {}",
@@ -686,6 +764,7 @@ mod tests {
                 batch_interval_duration: Some(1_000),
                 batch_id: None,
                 current_batch: false,
+                collection_job_id: None,
             },
         };
         let task_id_encoded = URL_SAFE_NO_PAD.encode(task_id.get_encoded());
@@ -942,6 +1021,7 @@ mod tests {
                 batch_interval_duration: None,
                 batch_id: None,
                 current_batch: true,
+                collection_job_id: None,
             },
         };
         let correct_arguments = [
@@ -983,6 +1063,7 @@ mod tests {
                 batch_interval_duration: None,
                 batch_id: Some(batch_id),
                 current_batch: false,
+                collection_job_id: None,
             },
         };
         let correct_arguments = [
@@ -1093,9 +1174,19 @@ mod tests {
             ErrorKind::ArgumentConflict
         );
 
-        let mut bad_arguments = base_arguments;
+        let mut bad_arguments = base_arguments.clone();
         bad_arguments.extend([
             "--batch-id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "--current-batch".to_string(),
+        ]);
+        assert_eq!(
+            Options::try_parse_from(bad_arguments).unwrap_err().kind(),
+            ErrorKind::ArgumentConflict
+        );
+
+        let mut bad_arguments = base_arguments;
+        bad_arguments.extend([
+            "--collection-job-id=QyPH5vr-MEwK2eIfe39_Mw".to_string(),
             "--current-batch".to_string(),
         ]);
         assert_eq!(
@@ -1218,6 +1309,7 @@ mod tests {
                 batch_interval_duration: Some(1_000),
                 batch_id: None,
                 current_batch: false,
+                collection_job_id: None,
             },
         };
 

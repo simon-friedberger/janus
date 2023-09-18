@@ -237,7 +237,7 @@ pub fn default_http_client() -> Result<reqwest::Client, Error> {
 /// Collector state related to a collection job that is in progress.
 #[derive(Derivative)]
 #[derivative(Debug)]
-struct CollectionJob<P, Q>
+pub struct CollectionJob<P, Q>
 where
     Q: QueryType,
 {
@@ -253,7 +253,7 @@ where
 }
 
 impl<P, Q: QueryType> CollectionJob<P, Q> {
-    fn new(
+    pub fn new(
         collection_job_url: Url,
         query: Query<Q>,
         aggregation_parameter: P,
@@ -270,7 +270,7 @@ impl<P, Q: QueryType> CollectionJob<P, Q> {
 #[derivative(Debug)]
 /// The result of a collect request poll operation. This will either provide the collection result
 /// or indicate that the collection is still being processed.
-enum PollResult<T, Q>
+pub enum PollResult<T, Q>
 where
     Q: QueryType,
 {
@@ -388,7 +388,7 @@ impl<V: vdaf::Collector> Collector<V> {
 
     /// Send a collect request to the leader aggregator.
     #[tracing::instrument(skip(aggregation_parameter), err)]
-    async fn start_collection<Q: QueryType>(
+    pub async fn start_collection<Q: QueryType>(
         &self,
         query: Query<Q>,
         aggregation_parameter: &V::AggregationParam,
@@ -443,7 +443,7 @@ impl<V: vdaf::Collector> Collector<V> {
     /// Request the results of an in-progress collection from the leader aggregator. This may
     /// return `Ok(None)` if the aggregation is not done yet.
     #[tracing::instrument(err)]
-    async fn poll_once<Q: QueryType>(
+    pub async fn poll_once<Q: QueryType>(
         &self,
         job: &CollectionJob<V::AggregationParam, Q>,
     ) -> Result<PollResult<V::AggregateResult, Q>, Error> {
@@ -563,7 +563,7 @@ impl<V: vdaf::Collector> Collector<V> {
 
     /// A convenience method to repeatedly request the result of an in-progress collection until it
     /// completes.
-    async fn poll_until_complete<Q: QueryType>(
+    pub async fn poll_until_complete<Q: QueryType>(
         &self,
         job: &CollectionJob<V::AggregationParam, Q>,
     ) -> Result<Collection<V::AggregateResult, Q>, Error> {
